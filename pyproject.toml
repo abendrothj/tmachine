@@ -54,6 +54,7 @@ ai = [
     "accelerate>=0.27.0",
     "openai-whisper>=20231117",
     "openai>=1.0.0",
+    "lpips>=0.1.4",
 ]
 
 # pip install -e ".[api]"

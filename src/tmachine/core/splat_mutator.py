@@ -180,9 +180,12 @@ class SplatMutator:
         # Per-splat L2 norm of SH-DC delta — shape (N,)
         dc_delta = (final_sh_dc - source.sh_dc.to(self.device)).norm(dim=-1)
 
-        # Include splats whose SH-DC colour or opacity changed past the threshold
+        # Higher-order SH delta — captures view-dependent specular changes (N,)
+        rest_delta = (final_sh_rest - source.sh_rest.to(self.device)).norm(dim=(-1, -2))
+
+        # Include splats whose SH (DC or rest) or opacity changed past the threshold
         opacity_delta = (final_raw_opacities - source.raw_opacities.to(self.device)).abs()
-        combined_delta = dc_delta + opacity_delta
+        combined_delta = dc_delta + rest_delta + opacity_delta
 
         mask = combined_delta > self.change_threshold        # (N,) bool
         indices = torch.where(mask)[0]                       # 1-D int64 tensor
@@ -339,6 +342,13 @@ class SplatMutator:
             loss_map = self._delta_engine.compute(rendered, edited_image)
             loss     = loss_map.total_loss
             loss.backward()
+
+            # Clip gradients to prevent instability on high-contrast edits
+            _grad_params = [sh_dc, sh_rest, raw_opacities]
+            if optimize_geometry:
+                _grad_params += [geo_means, geo_log_scales, geo_quats]
+            torch.nn.utils.clip_grad_norm_(_grad_params, max_norm=1.0)
+
             optimizer.step()
             scheduler.step()
 
@@ -351,8 +361,12 @@ class SplatMutator:
             if on_iter is not None:
                 on_iter(i, loss_val)
 
-            if i > 10 and abs(loss_history[-2] - loss_history[-1]) < convergence_threshold:
-                break
+            # Rolling-window convergence check (last 10 steps all quiet)
+            _CONV_WINDOW = 10
+            if len(loss_history) >= _CONV_WINDOW:
+                window = loss_history[-_CONV_WINDOW:]
+                if max(window) - min(window) < convergence_threshold:
+                    break
 
         # ── Finalise optimised parameters (detached) ──────────────────────
         final_sh_dc    = sh_dc.detach()

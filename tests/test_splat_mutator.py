@@ -259,5 +259,127 @@ class TestSplatMutatorGradientFlow(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(_GSPLAT_AVAILABLE, _SKIP_REASON)
+class TestSplatMutatorGeometryOptimization(unittest.TestCase):
+    """optimize_geometry=True: positions/scales/rotations receive gradients."""
+
+    def setUp(self):
+        self.device  = "cuda" if torch.cuda.is_available() else "cpu"
+        self.camera  = _make_camera()
+        self.cloud   = _make_cloud(device=self.device)
+
+    def _save_cloud_to_temp(self) -> str:
+        from tmachine.io.ply_handler import save_ply
+        fd, path = tempfile.mkstemp(suffix=".ply")
+        os.close(fd)
+        save_ply(self.cloud, path)
+        return path
+
+    def _make_target_image(self) -> torch.Tensor:
+        from tmachine.core.renderer import ViewportRenderer
+        renderer = ViewportRenderer(device=self.device)
+        original = renderer.render(self.camera, gaussians=self.cloud, sh_degree=3)
+        return (original + 0.05).clamp(0.0, 1.0).detach()
+
+    def test_loss_decreases_with_geometry_optimization(self):
+        """Loss must still decrease when geometry parameters are also optimised."""
+        from tmachine.core.splat_mutator import SplatMutator
+
+        ply_path     = self._save_cloud_to_temp()
+        target_image = self._make_target_image()
+
+        with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+            patch_path = f.name
+
+        try:
+            mutator = SplatMutator(ply_path, device=self.device)
+            result  = mutator.mutate(
+                camera=self.camera,
+                edited_image=target_image,
+                n_iters=3,
+                patch_path=patch_path,
+                sh_degree=3,
+                optimize_geometry=True,
+                convergence_threshold=0.0,
+            )
+        finally:
+            os.unlink(ply_path)
+            if os.path.exists(patch_path):
+                os.unlink(patch_path)
+
+        self.assertLess(
+            result.final_loss,
+            result.initial_loss,
+            msg=(
+                f"Loss did not decrease with optimize_geometry=True: "
+                f"initial={result.initial_loss:.6f}, final={result.final_loss:.6f}"
+            ),
+        )
+
+    def test_quaternion_normalization_preserved(self):
+        """
+        With optimize_geometry=True, the patch splats must have unit quaternions.
+        The normalization applied during the loop must survive into the saved patch.
+        """
+        from tmachine.core.splat_mutator import SplatMutator
+        from tmachine.io.ply_handler import load_ply
+
+        ply_path     = self._save_cloud_to_temp()
+        target_image = self._make_target_image()
+
+        with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+            patch_path = f.name
+
+        try:
+            mutator = SplatMutator(ply_path, device=self.device)
+            result  = mutator.mutate(
+                camera=self.camera,
+                edited_image=target_image,
+                n_iters=3,
+                patch_path=patch_path,
+                optimize_geometry=True,
+                convergence_threshold=0.0,
+            )
+            if result.changed_splat_count > 0:
+                patch = load_ply(result.patch_path, device="cpu")
+                norms = patch.quats.norm(dim=-1)
+                max_dev = (norms - 1.0).abs().max().item()
+                self.assertAlmostEqual(
+                    max_dev, 0.0, places=5,
+                    msg=f"Quaternions not unit-length after geometry optimization (max dev={max_dev:.2e})",
+                )
+        finally:
+            os.unlink(ply_path)
+            if os.path.exists(patch_path):
+                os.unlink(patch_path)
+
+    def test_no_nan_in_geometry_loss_history(self):
+        """Gradient clipping must prevent NaN when geometry is unlocked."""
+        from tmachine.core.splat_mutator import SplatMutator
+
+        ply_path     = self._save_cloud_to_temp()
+        target_image = self._make_target_image()
+
+        with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+            patch_path = f.name
+
+        try:
+            mutator = SplatMutator(ply_path, device=self.device)
+            result  = mutator.mutate(
+                camera=self.camera,
+                edited_image=target_image,
+                n_iters=20,
+                patch_path=patch_path,
+                optimize_geometry=True,
+            )
+        finally:
+            os.unlink(ply_path)
+            if os.path.exists(patch_path):
+                os.unlink(patch_path)
+
+        nan_iters = [i for i, v in enumerate(result.loss_history) if math.isnan(v)]
+        self.assertEqual(nan_iters, [], msg=f"NaN loss at iterations {nan_iters}")
+
+
 if __name__ == "__main__":
     unittest.main()

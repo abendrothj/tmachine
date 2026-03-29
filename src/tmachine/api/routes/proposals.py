@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from ...db import MemoryLayer, MemoryProposal, ProposalStatus, get_db
 from ..models import JobResponse, JobStatusResponse, VoiceJobResponse
+from ..utils import validate_scene_path
 from ..worker import (
     bake_approved_patch,
     celery_app,
@@ -44,10 +45,12 @@ router = APIRouter()
 # Pydantic / response schemas (inline to keep the file self-contained)
 # ---------------------------------------------------------------------------
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class ProposalOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id:           int
     scene:        str
     prompt:       str
@@ -57,11 +60,10 @@ class ProposalOut(BaseModel):
     preview_path: str
     bake_job_id:  Optional[str]
 
-    class Config:
-        from_attributes = True
-
 
 class LayerOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id:                  int
     proposal_id:         int
     scene:               str
@@ -70,9 +72,6 @@ class LayerOut(BaseModel):
     changed_splat_count: int
     initial_loss:        float
     final_loss:          float
-
-    class Config:
-        from_attributes = True
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +96,7 @@ async def propose_from_prompt(
     Enqueue Stage 1: render → InstructPix2Pix edit → save PENDING proposal.
     Returns a job_id; poll /status/{job_id} to get the proposal_id when done.
     """
+    scene = validate_scene_path(scene)
     from ..models import CameraParams
     try:
         camera_dict = CameraParams(**json.loads(camera)).model_dump()

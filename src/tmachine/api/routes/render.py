@@ -32,6 +32,9 @@ from __future__ import annotations
 
 import io
 import math
+import os
+import threading
+from collections import OrderedDict
 from typing import Annotated, List, Optional
 
 import numpy as np
@@ -43,6 +46,7 @@ from PIL import Image
 from ...core.renderer import ViewportRenderer
 from ...io.ply_handler import GaussianCloud, load_ply
 from ...utils.camera import camera_from_fov
+from ..utils import validate_scene_path
 
 router = APIRouter()
 
@@ -83,14 +87,38 @@ class _RenderQuery:
         self.active_layers = active_layers
 
 
-# Base-scene renderer cache (keyed by ply path).
-_renderer_cache: dict[str, ViewportRenderer] = {}
+# ---------------------------------------------------------------------------
+# Renderer cache — LRU, bounded, thread-safe
+# ---------------------------------------------------------------------------
+# Max scenes held in GPU/CPU memory at once. Override via env var.
+_CACHE_MAX_SIZE = int(os.environ.get("TMACHINE_RENDERER_CACHE_SIZE", "8"))
+
+
+class _RendererCache:
+    """Thread-safe LRU cache for ViewportRenderer instances."""
+
+    def __init__(self, max_size: int = _CACHE_MAX_SIZE) -> None:
+        self._cache: OrderedDict[str, ViewportRenderer] = OrderedDict()
+        self._lock  = threading.Lock()
+        self._max   = max_size
+
+    def get(self, scene: str) -> ViewportRenderer:
+        with self._lock:
+            if scene in self._cache:
+                self._cache.move_to_end(scene)
+                return self._cache[scene]
+            renderer = ViewportRenderer(scene)
+            self._cache[scene] = renderer
+            if len(self._cache) > self._max:
+                self._cache.popitem(last=False)  # evict least-recently-used
+            return renderer
+
+
+_renderer_cache = _RendererCache()
 
 
 def _get_renderer(scene: str) -> ViewportRenderer:
-    if scene not in _renderer_cache:
-        _renderer_cache[scene] = ViewportRenderer(scene)
-    return _renderer_cache[scene]
+    return _renderer_cache.get(scene)
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +229,10 @@ async def render_view(params: Annotated[_RenderQuery, Depends()]) -> StreamingRe
     except (ValueError, Exception) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    scene = validate_scene_path(params.scene)
+
     try:
-        renderer = _get_renderer(params.scene)
+        renderer = _get_renderer(scene)
 
         if params.active_layers:
             # Composite layers onto the base cloud, then render
@@ -213,7 +243,7 @@ async def render_view(params: Annotated[_RenderQuery, Depends()]) -> StreamingRe
             image_tensor = renderer.render(camera)
 
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=f"Scene not found: {exc}") from exc
+        raise HTTPException(status_code=404, detail=f"Scene not found: {scene}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Render failed: {exc}") from exc
 

@@ -25,6 +25,7 @@ Interface
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -60,20 +61,27 @@ class LossMap:
         Python float — fraction of pixels flagged by ``change_mask``.
     """
 
-    pixel_diff:           torch.Tensor   # (H, W, 3)
-    luminance_diff:       torch.Tensor   # (H, W)
-    change_mask:          torch.Tensor   # (H, W) bool
-    l1_loss:              torch.Tensor   # scalar
-    l2_loss:              torch.Tensor   # scalar
-    total_loss:           torch.Tensor   # scalar  ← backward() target
+    pixel_diff:           torch.Tensor            # (H, W, 3)
+    luminance_diff:       torch.Tensor            # (H, W)
+    change_mask:          torch.Tensor            # (H, W) bool
+    l1_loss:              torch.Tensor            # scalar
+    l2_loss:              torch.Tensor            # scalar
+    lpips_loss:           Optional[torch.Tensor]  # scalar, None when LPIPS disabled
+    total_loss:           torch.Tensor            # scalar  ← backward() target
     changed_pixel_ratio:  float
 
     def __repr__(self) -> str:
+        lpips_str = (
+            f", LPIPS={self.lpips_loss.item():.5f}"
+            if self.lpips_loss is not None
+            else ""
+        )
         return (
             f"LossMap("
             f"total={self.total_loss.item():.5f}, "
             f"L1={self.l1_loss.item():.5f}, "
-            f"L2={self.l2_loss.item():.5f}, "
+            f"L2={self.l2_loss.item():.5f}"
+            f"{lpips_str}, "
             f"changed={self.changed_pixel_ratio:.2%})"
         )
 
@@ -95,6 +103,10 @@ class DeltaEngine:
         Weight for L1 (MAE) loss in ``total_loss``.  Default 0.8.
     l2_weight : float
         Weight for L2 (MSE) loss in ``total_loss``.  Default 0.2.
+    lpips_weight : float
+        Weight for LPIPS perceptual loss in ``total_loss``.  Default 0.0
+        (disabled).  When non-zero, requires ``pip install lpips``.
+        ``l1_weight + l2_weight + lpips_weight`` must equal 1.0.
     change_threshold : float
         Minimum luminance delta (in [0, 1]) to flag a pixel as changed in
         ``change_mask``.  Default 0.01 (≈ 3 intensity steps out of 255).
@@ -107,16 +119,19 @@ class DeltaEngine:
         self,
         l1_weight: float = 0.8,
         l2_weight: float = 0.2,
+        lpips_weight: float = 0.0,
         change_threshold: float = 0.01,
     ) -> None:
-        if abs(l1_weight + l2_weight - 1.0) > 1e-6:
+        if abs(l1_weight + l2_weight + lpips_weight - 1.0) > 1e-6:
             raise ValueError(
-                f"l1_weight + l2_weight should equal 1.0, "
-                f"got {l1_weight + l2_weight}"
+                f"l1_weight + l2_weight + lpips_weight must equal 1.0, "
+                f"got {l1_weight + l2_weight + lpips_weight}"
             )
         self.l1_weight        = l1_weight
         self.l2_weight        = l2_weight
+        self.lpips_weight     = lpips_weight
         self.change_threshold = change_threshold
+        self._lpips_fn        = None  # lazy-loaded
 
     def compute(
         self,
@@ -164,12 +179,50 @@ class DeltaEngine:
         l2_loss = ((edited - original) ** 2).mean()
         total_loss = self.l1_weight * l1_loss + self.l2_weight * l2_loss
 
+        # ── Optional LPIPS perceptual loss ─────────────────────────────
+        lpips_loss: Optional[torch.Tensor] = None
+        if self.lpips_weight > 0.0:
+            lpips_loss  = self._compute_lpips(original, edited)
+            total_loss  = total_loss + self.lpips_weight * lpips_loss
+
         return LossMap(
             pixel_diff=pixel_diff,
             luminance_diff=luminance_diff,
             change_mask=change_mask,
             l1_loss=l1_loss,
             l2_loss=l2_loss,
+            lpips_loss=lpips_loss,
             total_loss=total_loss,
             changed_pixel_ratio=change_mask.float().mean().item(),
         )
+
+    # ------------------------------------------------------------------
+    # LPIPS helper
+    # ------------------------------------------------------------------
+
+    def _compute_lpips(self, original: torch.Tensor, edited: torch.Tensor) -> torch.Tensor:
+        """
+        Compute LPIPS perceptual distance between two (H, W, 3) images.
+
+        Lazy-loads the ``lpips`` model on the first call and caches it.
+        Requires ``pip install lpips`` (or ``pip install tmachine[ai]``).
+        """
+        if self._lpips_fn is None:
+            try:
+                import lpips as _lpips_lib
+            except ImportError as exc:
+                raise ImportError(
+                    "lpips is required when lpips_weight > 0. "
+                    "Install with: pip install lpips"
+                ) from exc
+            self._lpips_fn = _lpips_lib.LPIPS(net="alex", verbose=False)
+            self._lpips_fn.eval()
+
+        device = original.device
+        self._lpips_fn = self._lpips_fn.to(device)  # type: ignore[assignment]
+
+        # lpips expects (N, 3, H, W) in [-1, 1]
+        def _to_lpips(t: torch.Tensor) -> torch.Tensor:
+            return t.permute(2, 0, 1).unsqueeze(0) * 2.0 - 1.0
+
+        return self._lpips_fn(_to_lpips(original), _to_lpips(edited)).squeeze()
