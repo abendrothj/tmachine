@@ -126,9 +126,66 @@ class GaussianCloud:
 # I/O
 # ---------------------------------------------------------------------------
 
+def _is_gaussian_splat(vertex) -> bool:
+    """Return True if this PLY vertex element contains 3DGS fields."""
+    names = {p.name for p in vertex.properties}
+    return "opacity" in names and "f_dc_0" in names
+
+
+def _load_point_cloud_as_gaussians(vertex, device: str) -> GaussianCloud:
+    """
+    Convert a plain RGB point cloud (x, y, z, red, green, blue) into a
+    GaussianCloud of tiny spherical splats.  Quality is limited (no
+    view-dependent colour, fixed size) but the scene will render.
+    """
+    N = len(vertex["x"])
+
+    means = np.stack(
+        [vertex["x"], vertex["y"], vertex["z"]], axis=1
+    ).astype(np.float32)  # (N, 3)
+
+    # Identity quaternion (w=1, x=0, y=0, z=0) → upright spheres
+    quats = np.zeros((N, 4), dtype=np.float32)
+    quats[:, 0] = 1.0
+
+    # Small uniform scale: log(0.005) ≈ -5.3 → ~5 mm splats
+    log_scales = np.full((N, 3), -5.3, dtype=np.float32)
+
+    # High opacity: sigmoid(3) ≈ 0.95
+    raw_opacities = np.full(N, 3.0, dtype=np.float32)
+
+    # Convert uint8 RGB [0..255] → SH DC coefficient
+    # gsplat converts SH DC to colour as: colour = 0.5 + SH_0 * C0  (C0 ≈ 0.2821)
+    # So: SH_0 = (colour - 0.5) / C0
+    C0 = 0.28209479177387814
+    r = np.asarray(vertex["red"],   dtype=np.float32) / 255.0
+    g = np.asarray(vertex["green"], dtype=np.float32) / 255.0
+    b = np.asarray(vertex["blue"],  dtype=np.float32) / 255.0
+    sh_dc = np.stack(
+        [(r - 0.5) / C0, (g - 0.5) / C0, (b - 0.5) / C0], axis=1
+    )  # (N, 3)
+
+    # No higher-order SH (degree 0 — direction-agnostic colour)
+    sh_rest = np.zeros((N, 0, 3), dtype=np.float32)
+
+    return GaussianCloud(
+        means=torch.from_numpy(means).to(device),
+        quats=torch.from_numpy(quats).to(device),
+        log_scales=torch.from_numpy(log_scales).to(device),
+        raw_opacities=torch.from_numpy(raw_opacities).to(device),
+        sh_dc=torch.from_numpy(sh_dc).to(device),
+        sh_rest=torch.from_numpy(sh_rest).to(device),
+    )
+
+
 def load_ply(path: str | Path, device: str = "cpu") -> GaussianCloud:
     """
-    Load a 3DGS scene from an Inria-format .ply file.
+    Load a 3DGS scene from an Inria-format .ply file, or an RGB point cloud.
+
+    Accepts both:
+    - Full 3DGS .ply files (f_dc_, f_rest_, opacity, scale_, rot_ fields)
+    - Plain RGB point clouds (x, y, z, red, green, blue) — converted to
+      naïve spherical Gaussians for basic rendering.
 
     Parameters
     ----------
@@ -145,6 +202,9 @@ def load_ply(path: str | Path, device: str = "cpu") -> GaussianCloud:
 
     plydata = PlyData.read(str(path))
     vertex = plydata.elements[0]
+
+    if not _is_gaussian_splat(vertex):
+        return _load_point_cloud_as_gaussians(vertex, device)
 
     # ── Positions ──────────────────────────────────────────────────────────
     means = np.stack(

@@ -118,7 +118,13 @@ class ViewportRenderer:
         quats     = g.quats.to(dev)        # (N, 4)  normalised quaternions
         scales    = g.scales.to(dev)       # (N, 3)  exp(log_scales)
         opacities = g.opacities.to(dev)    # (N,)    sigmoid(raw_opacities)
-        colors    = g.sh_all.to(dev)       # (N, 16, 3) full SH coefficients
+        colors    = g.sh_all.to(dev)       # (N, K, 3) full SH coefficients
+
+        # Clamp sh_degree to what's actually stored in the cloud.
+        # A plain point-cloud import has sh_rest with 0 bands → degree 0.
+        n_bands   = colors.shape[1]             # 1 for degree-0, 16 for degree-3
+        max_deg   = int(n_bands ** 0.5) - 1    # 0, 1, 2, or 3
+        sh_degree = min(sh_degree, max_deg)
 
         # gsplat expects batched camera inputs: (C, 4, 4) and (C, 3, 3)
         viewmat = camera.viewmat.unsqueeze(0).to(dev)   # (1, 4, 4)
