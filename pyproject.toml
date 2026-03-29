@@ -6,7 +6,26 @@ build-backend = "setuptools.build_meta"
 name = "tmachine"
 version = "0.1.0"
 description = "Agnostic 3D Gaussian Splat mutation engine: render → diff → backprop."
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
+authors = [
+    { name = "tmachine contributors" },
+]
+keywords = ["3d gaussian splatting", "neural rendering", "differentiable rendering", "nerf", "gsplat"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Graphics :: 3D Rendering",
+    "Typing :: Typed",
+]
 dependencies = [
     "torch>=2.0.0",
     "gsplat>=1.0.0",
@@ -14,6 +33,12 @@ dependencies = [
     "numpy>=1.24.0",
     "Pillow>=10.0.0",
 ]
+
+[project.urls]
+"Homepage"    = "https://github.com/abendrothj/tmachine"
+"Repository"  = "https://github.com/abendrothj/tmachine"
+"Bug Tracker" = "https://github.com/abendrothj/tmachine/issues"
+
 
 [project.optional-dependencies]
 dev = [
@@ -50,9 +75,20 @@ full = ["tmachine[ai,api]"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+tmachine = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths   = ["tests"]
 addopts     = "-v --tb=short"
 markers     = [
     "gpu: marks tests that require CUDA (deselect with -m 'not gpu')",
 ]
+
+[tool.coverage.run]
+source = ["tmachine"]
+omit   = ["*/tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

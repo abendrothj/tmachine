@@ -11,3 +11,5 @@ previews/
 patches/
 *.lock
 .env
+.coverage
+htmlcov/
