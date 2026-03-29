@@ -36,6 +36,15 @@ GET  /health              → {"status": "ok"}
 
 from __future__ import annotations
 
+from pathlib import Path
+
+# Load .env from the project root if present (no-op if python-dotenv not installed)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent.parent.parent / ".env")
+except ImportError:
+    pass
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
