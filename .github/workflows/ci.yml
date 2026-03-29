@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: "Python ${{ matrix.python-version }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Install CPU-only PyTorch first so gsplat (a core dep) doesn't pull
+      # in a CUDA build — and so the install stays fast on hosted runners.
+      - name: Install CPU PyTorch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      # [dev]  → pytest, pytest-cov, httpx (TestClient transport)
+      # [api]  → fastapi, celery, sqlalchemy, etc. (needed for Tier-3 tests)
+      # AI extras are intentionally excluded: no GPU, no diffusers, no Whisper.
+      # Tier-2 (gsplat) tests auto-skip when gsplat can't compile CUDA kernels.
+      - name: Install package
+        run: pip install -e ".[dev,api]"
+
+      # -m "not gpu"  → skips any test explicitly tagged @pytest.mark.gpu
+      # Tier-2 tests skip themselves when gsplat extensions are unavailable.
+      - name: Test
+        run: pytest -m "not gpu" --cov=tmachine --cov-report=term-missing
