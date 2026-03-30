@@ -55,10 +55,11 @@ Interface
 
 from __future__ import annotations
 
-import logging
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+import tempfile
+import uuid
 from typing import Callable, List, Optional
 
 import numpy as np
@@ -85,9 +86,10 @@ class MutationResult:
     iterations_run : int
         Number of gradient steps taken.
     initial_loss : float
-        Total loss at iteration 0.
+        Masked loss (plus consistency loss if consistency cameras were
+        supplied) at iteration 0.
     final_loss : float
-        Total loss at the last iteration.
+        Masked loss (plus consistency loss) at the last iteration.
     patch_path : str
         Path to the saved patch .ply (contains only the changed splats).
     hidden_indices : list[int]
@@ -151,6 +153,16 @@ class SplatMutator:
         Minimum L2 norm of the SH-DC delta (per splat, summed across RGB)
         for a splat to be considered changed.  Tune lower to capture subtle
         colour shifts; higher to ignore noise.
+    adaptive_threshold : bool
+        When ``True`` (default), normalises per-splat deltas by the scene's
+        maximum SH-DC coefficient magnitude before applying
+        ``change_threshold``.  Makes the threshold dimensionless and
+        consistent across scenes with different SH scales.
+    delta_engine : DeltaEngine, optional
+        Pre-constructed :class:`~tmachine.core.delta_engine.DeltaEngine` to
+        share across multiple :class:`SplatMutator` instances.  Avoids
+        re-loading the LPIPS model (≈30 MB) per mutator.  When ``None`` a
+        fresh engine is constructed.
     """
 
     def __init__(
@@ -163,17 +175,20 @@ class SplatMutator:
         scheduler_gamma: float = 0.995,
         convergence_window: int = 10,
         change_threshold: float = 1e-3,
+        adaptive_threshold: bool = True,
+        delta_engine: Optional[DeltaEngine] = None,
     ) -> None:
-        self.device           = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.lr_sh            = lr_sh
-        self.lr_opacity       = lr_opacity
-        self.lr_geometry      = lr_geometry
-        self.scheduler_gamma  = scheduler_gamma
-        self.convergence_window = convergence_window
-        self.change_threshold = change_threshold
+        self.device              = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.lr_sh               = lr_sh
+        self.lr_opacity          = lr_opacity
+        self.lr_geometry         = lr_geometry
+        self.scheduler_gamma     = scheduler_gamma
+        self.convergence_window  = convergence_window
+        self.change_threshold    = change_threshold
+        self.adaptive_threshold  = adaptive_threshold
 
         self._renderer     = ViewportRenderer(device=self.device)
-        self._delta_engine = DeltaEngine()
+        self._delta_engine = delta_engine if delta_engine is not None else DeltaEngine()
 
         if isinstance(scene, GaussianCloud):
             self.ply_path = None
@@ -233,7 +248,15 @@ class SplatMutator:
             quat_delta  = (final_quats      - source.quats.to(self.device)).norm(dim=-1)
             combined_delta = combined_delta + pos_delta + scale_delta + quat_delta
 
-        mask = combined_delta > self.change_threshold        # (N,) bool
+        # Normalise per-splat deltas by the scene's SH coefficient scale so
+        # that change_threshold is dimensionless and consistent across scenes
+        # with different parameter ranges (low-contrast vs high-contrast).
+        if self.adaptive_threshold:
+            sh_scale = source.sh_dc.to(self.device).abs().max().clamp(min=1e-6).item()
+            effective_threshold = self.change_threshold * sh_scale
+        else:
+            effective_threshold = self.change_threshold
+        mask = combined_delta > effective_threshold          # (N,) bool
         indices = torch.where(mask)[0]                       # 1-D int64 tensor
 
         if indices.numel() == 0:
@@ -273,7 +296,9 @@ class SplatMutator:
         sh_degree: int = 3,
         optimize_geometry: bool = False,
         on_iter: Optional[Callable[[int, float], None]] = None,
-        convergence_threshold: float = 1e-7,
+        convergence_threshold: float = 1e-4,
+        consistency_cameras: Optional[list[Camera]] = None,
+        consistency_weight: float = 0.1,
     ) -> MutationResult:
         """
         Optimise the GaussianCloud to match *edited_image* from *camera*,
@@ -291,13 +316,31 @@ class SplatMutator:
             Where to save the patch .ply.  Defaults to
             ``<source_stem>_patch_<hex8>.ply`` alongside the source file.
         sh_degree :
-            Must match the SH degree of the scene (usually 3).
+            SH degree to use during optimisation (0–3).  Clamped to the
+            degree stored in the scene, so passing ``3`` to a degree-0 point
+            cloud is safe — it will silently use degree 0.
         optimize_geometry :
             If True, also optimise positions, scales, and rotations.
         on_iter :
             Progress callback fired after every iteration.
         convergence_threshold :
-            Stop early when |loss[t] − loss[t−1]| < this value.
+            Stop early when the rolling-window loss range drops below
+            ``convergence_threshold * initial_loss`` (relative test).
+            Defaults to ``1e-4``.
+        consistency_cameras :
+            Optional list of :class:`~tmachine.utils.camera.Camera` objects
+            used to enforce multi-view consistency.  Before the loop the scene
+            is rendered from each viewpoint (without gradients) to record the
+            pre-edit appearance.  Each iteration the current renders are
+            compared to those targets; the MSE is added to the loss scaled by
+            ``consistency_weight``.  Use
+            :func:`~tmachine.utils.camera.auto_consistency_cameras` to
+            auto-generate cameras from the primary.  Default: ``None``
+            (single-view).
+        consistency_weight :
+            Scale of the multi-view consistency loss.  Larger values enforce
+            stronger view preservation at the cost of edit fidelity.
+            Default: ``0.1``.
 
         Returns
         -------
@@ -317,7 +360,6 @@ class SplatMutator:
 
         # ── Default patch path ─────────────────────────────────────────────
         if patch_path is None:
-            import uuid
             hex8 = uuid.uuid4().hex[:8]
             if self.ply_path is not None:
                 patch_path = str(
@@ -325,7 +367,6 @@ class SplatMutator:
                     / f"{self.ply_path.stem}_patch_{hex8}.ply"
                 )
             else:
-                import tempfile
                 patch_path = str(
                     Path(tempfile.gettempdir()) / f"tmachine_patch_{hex8}.ply"
                 )
@@ -363,6 +404,17 @@ class SplatMutator:
         optimizer = optim.Adam(optim_groups, eps=1e-8)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.scheduler_gamma)
 
+        # ── Pre-capture consistency targets (once, before the loop) ────────────
+        # These are the pre-edit renders we want unchanged viewpoints to match.
+        _consistency_targets: Optional[torch.Tensor] = None
+        if consistency_cameras is not None:
+            with torch.no_grad():
+                _consistency_targets = self._renderer.render_batch(
+                    cameras=consistency_cameras,
+                    gaussians=self._source,
+                    sh_degree=sh_degree,
+                ).detach()  # (C, H, W, 3)
+
         # ── Optimisation loop ──────────────────────────────────────────────
         loss_history: list[float] = []
         initial_loss: float = 0.0
@@ -393,7 +445,21 @@ class SplatMutator:
             )
 
             loss_map = self._delta_engine.compute(rendered, edited_image)
-            loss     = loss_map.total_loss
+            # masked_loss focuses gradient on changed pixels;
+            # falls back to total_loss internally when the mask is empty.
+            loss = loss_map.masked_loss
+
+            # Multi-view consistency — penalise any change visible from the
+            # consistency cameras relative to their pre-edit appearance.
+            if consistency_cameras is not None and _consistency_targets is not None:
+                cons_renders = self._renderer.render_batch(
+                    cameras=consistency_cameras,
+                    gaussians=working_cloud,
+                    sh_degree=sh_degree,
+                )  # (C, H, W, 3)
+                cons_loss = (cons_renders - _consistency_targets).pow(2).mean()
+                loss = loss + consistency_weight * cons_loss
+
             loss.backward()
 
             # Clip gradients to prevent instability on high-contrast edits
@@ -414,10 +480,14 @@ class SplatMutator:
             if on_iter is not None:
                 on_iter(i, loss_val)
 
-            # Rolling-window convergence check
+            # Rolling-window convergence check — relative to initial loss so
+            # the threshold scales correctly across scenes with different loss
+            # magnitudes (an absolute 1e-7 never fires under LR decay, and is
+            # too loose for losses already near zero).
             if len(loss_history) >= self.convergence_window:
                 window = loss_history[-self.convergence_window:]
-                if max(window) - min(window) < convergence_threshold:
+                relative_tol = convergence_threshold * max(initial_loss, 1e-8)
+                if max(window) - min(window) < relative_tol:
                     break
 
         # ── Finalise optimised parameters (detached) ──────────────────────

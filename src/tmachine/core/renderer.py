@@ -159,3 +159,81 @@ class ViewportRenderer:
 
         # renders: (1, H, W, 3) → (H, W, 3), clipped to [0, 1]
         return renders.squeeze(0).clamp(0.0, 1.0)
+
+    def render_batch(
+        self,
+        cameras: list,
+        gaussians: Optional[GaussianCloud] = None,
+        sh_degree: int = 3,
+        background: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        packed: bool = False,
+    ) -> torch.Tensor:
+        """
+        Render the scene from multiple cameras in a single batched kernel call.
+
+        All cameras must share the same ``width`` and ``height``.
+
+        Parameters
+        ----------
+        cameras :
+            Ordered list of :class:`~tmachine.utils.camera.Camera` objects.
+        All other parameters as per :meth:`render`.
+
+        Returns
+        -------
+        torch.Tensor
+            (C, H, W, 3) float32 image batch in [0, 1] on the renderer's device.
+            Gradient history is preserved for back-propagation.
+        """
+        if not cameras:
+            raise ValueError("cameras list is empty.")
+        w, h = cameras[0].width, cameras[0].height
+        if any(c.width != w or c.height != h for c in cameras):
+            raise ValueError(
+                "All cameras passed to render_batch must share the same "
+                "width and height."
+            )
+
+        g = gaussians if gaussians is not None else self.gaussians
+        if g is None:
+            raise RuntimeError(
+                "No scene loaded.  Call ViewportRenderer.load(ply_path) "
+                "or pass gaussians= explicitly."
+            )
+
+        dev = self.device
+        means     = g.means.to(dev)
+        quats     = g.quats.to(dev)
+        scales    = g.scales.to(dev)
+        opacities = g.opacities.to(dev)
+        colors    = g.sh_all.to(dev)
+
+        n_bands   = colors.shape[1]
+        max_deg   = int(n_bands ** 0.5) - 1
+        sh_degree = min(sh_degree, max_deg)
+
+        C        = len(cameras)
+        viewmats = torch.stack([c.viewmat for c in cameras]).to(dev)  # (C, 4, 4)
+        Ks       = torch.stack([c.K       for c in cameras]).to(dev)  # (C, 3, 3)
+        bg = torch.tensor(
+            background, dtype=torch.float32, device=dev
+        ).unsqueeze(0).expand(C, -1).contiguous()  # (C, 3)
+
+        renders, _alphas, _meta = rasterization(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            viewmats=viewmats,
+            Ks=Ks,
+            width=w,
+            height=h,
+            sh_degree=sh_degree,
+            backgrounds=bg,
+            near_plane=cameras[0].near,
+            far_plane=cameras[0].far,
+            packed=packed,
+        )
+
+        return renders.clamp(0.0, 1.0)  # (C, H, W, 3)

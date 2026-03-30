@@ -111,7 +111,8 @@ class TestBakePatchHappyPath(unittest.TestCase):
     def setUp(self):
         self.Session = _make_in_memory_session()
 
-    def test_memory_layer_written_on_success(self):
+    @patch("tmachine.api.worker._load_scene_cached", return_value=MagicMock())
+    def test_memory_layer_written_on_success(self, _mock_scene):
         from tmachine.db.models import MemoryLayer
         from tmachine.api.worker import bake_patch
 

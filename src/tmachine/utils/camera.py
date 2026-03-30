@@ -257,3 +257,106 @@ def camera_from_fov(
         cx=cx, cy=cy,
         near=near, far=far,
     )
+
+
+def camera_from_colmap(
+    R: np.ndarray,
+    t: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    width: int,
+    height: int,
+    near: float = 0.01,
+    far: float = 1_000.0,
+) -> Camera:
+    """
+    Construct a Camera from COLMAP-style world-to-camera extrinsics.
+
+    COLMAP exports rotation matrix ``R`` and translation ``t`` where
+    ``t = R @ (−position_world)``, so ``position_world = −R.T @ t``.
+
+    Parameters
+    ----------
+    R : (3, 3) float ndarray
+        World-to-camera rotation matrix (orthonormal, row-major).
+    t : (3,) float ndarray
+        World-to-camera translation vector.
+    fx, fy : float
+        Focal lengths in pixels from the COLMAP Camera model.
+    cx, cy : float
+        Principal point in pixels.
+    width, height : int
+        Image dimensions in pixels.
+    near, far : float
+        Clipping plane distances.
+
+    Returns
+    -------
+    Camera
+    """
+    R_arr = np.asarray(R, dtype=np.float32)
+    t_arr = np.asarray(t, dtype=np.float32)
+    position = -(R_arr.T @ t_arr)   # world-space camera centre
+    return Camera(
+        position=position,
+        R=R_arr,
+        fx=float(fx),
+        fy=float(fy),
+        cx=float(cx),
+        cy=float(cy),
+        width=int(width),
+        height=int(height),
+        near=float(near),
+        far=float(far),
+    )
+
+
+def auto_consistency_cameras(
+    primary: Camera,
+    count: int = 4,
+    yaw_step_deg: float = 30.0,
+) -> "list[Camera]":
+    """
+    Generate consistency cameras by rotating the primary camera's yaw.
+
+    Cameras are generated at ±yaw_step_deg, ±2×yaw_step_deg, … alternating
+    left and right.  The primary camera's position, pitch, and roll are
+    preserved — only the horizontal viewing direction changes.
+
+    Use these cameras with :meth:`~tmachine.core.splat_mutator.SplatMutator.mutate`
+    ``consistency_cameras`` to coarsely guard against multi-view drift without
+    requiring a supplied camera trajectory.
+
+    Parameters
+    ----------
+    primary : Camera
+        The bake-viewpoint camera.
+    count : int
+        Total number of consistency cameras to generate.
+    yaw_step_deg : float
+        Angular step between successive cameras (degrees).
+
+    Returns
+    -------
+    list[Camera]
+        *count* cameras, alternating left and right of the primary yaw.
+    """
+    cameras: list[Camera] = []
+    for k in range(1, count + 1):
+        sign      = +1 if k % 2 == 1 else -1
+        magnitude = (k + 1) // 2
+        delta     = math.radians(sign * magnitude * yaw_step_deg)
+        # Rotate the world by −delta before applying primary R, which is
+        # equivalent to rotating the camera yaw by +delta in world space.
+        R_new = (primary.R @ _Ry(-delta)).astype(np.float32)
+        cameras.append(Camera(
+            position=primary.position.copy(),
+            R=R_new,
+            fx=primary.fx, fy=primary.fy,
+            cx=primary.cx, cy=primary.cy,
+            width=primary.width, height=primary.height,
+            near=primary.near, far=primary.far,
+        ))
+    return cameras

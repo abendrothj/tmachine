@@ -80,7 +80,7 @@ The engine is a sequential three-module pipeline. Each module is usable in isola
 
 **Why operate in 2D?**
 
-Every text-to-3D approach risks destroying multi-view consistency: change a splat in one view and it looks wrong from every other angle. TMachine sidesteps this by confining the generative model to the 2D domain — the space it was trained in — and using the differentiability of the renderer to pull the change back into 3D parameters.
+The generative model runs in 2D — the domain it was trained on — and the differentiable renderer propagates the edit back into 3D Gaussian parameters. This keeps the generative step cheap and deterministic, but it is a **single-view optimisation**: the patch is guaranteed to look correct from the baked camera angle only. Appearance from other viewpoints is unconstrained by the optimizer. If angular consistency matters, bake the same edit from multiple cameras and blend the resulting patches.
 
 **Why patches, not overwrites?**
 

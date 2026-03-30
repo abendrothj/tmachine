@@ -116,13 +116,17 @@ class DeltaEngine:
     change_threshold : float
         Minimum luminance delta (in [0, 1]) to flag a pixel as changed in
         ``change_mask``.  Default 0.01 (≈ 3 intensity steps out of 255).
+    mask_dilation : int
+        Radius (in pixels) of a morphological dilation applied to
+        ``change_mask`` after thresholding.  Expands the masked region so
+        that splats bordering the edit receive gradient signal too, reducing
+        patch boundary artefacts.  Default 0 (disabled).
     """
 
     # ITU-R BT.601 luma weights (matches human perceptual brightness)
     # Stored as float32 regardless of input dtype — fp16 rounding on these
     # coefficients is large enough to corrupt the luminance diff meaningfully.
     _LUMA = (0.299, 0.587, 0.114)
-    _luma_tensor: Optional[torch.Tensor] = None  # cached per-device, always fp32
 
     def __init__(
         self,
@@ -130,6 +134,7 @@ class DeltaEngine:
         l2_weight: float = 0.2,
         lpips_weight: float = 0.0,
         change_threshold: float = 0.01,
+        mask_dilation: int = 0,
     ) -> None:
         if abs(l1_weight + l2_weight + lpips_weight - 1.0) > 1e-6:
             raise ValueError(
@@ -140,6 +145,7 @@ class DeltaEngine:
         self.l2_weight        = l2_weight
         self.lpips_weight     = lpips_weight
         self.change_threshold = change_threshold
+        self.mask_dilation    = mask_dilation
         self._lpips_fn        = None  # lazy-loaded
         self._lpips_device: str | None = None
         self._luma_cache: dict[str, torch.Tensor] = {}  # device → fp32 luma tensor
@@ -189,7 +195,18 @@ class DeltaEngine:
 
         # ── Change mask ────────────────────────────────────────────────────
         change_mask = luminance_diff > self.change_threshold  # (H, W) bool
-
+        # Optional morphological dilation — softens sharp edit boundaries
+        # and gives adjacent splats gradient signal they would otherwise lack.
+        if self.mask_dilation > 0:
+            from torch.nn import functional as _F
+            k = 2 * self.mask_dilation + 1
+            dilated = _F.max_pool2d(
+                change_mask.float().unsqueeze(0).unsqueeze(0),
+                kernel_size=k,
+                stride=1,
+                padding=self.mask_dilation,
+            )
+            change_mask = dilated.squeeze().bool()
         # ── Differentiable losses ──────────────────────────────────────────
         l1_loss = pixel_diff.mean()
         l2_loss = ((edited - original) ** 2).mean()
@@ -213,7 +230,10 @@ class DeltaEngine:
         lpips_loss: Optional[torch.Tensor] = None
         if self.lpips_weight > 0.0:
             lpips_loss  = self._compute_lpips(original, edited)
-            total_loss  = total_loss + self.lpips_weight * lpips_loss
+            total_loss  = total_loss  + self.lpips_weight * lpips_loss
+            # LPIPS is a whole-image perceptual signal — no spatial mask exists,
+            # so it is added to masked_loss verbatim (same weight as total_loss).
+            masked_loss = masked_loss + self.lpips_weight * lpips_loss
 
         return LossMap(
             pixel_diff=pixel_diff,

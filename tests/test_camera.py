@@ -21,7 +21,13 @@ import unittest
 import numpy as np
 import torch
 
-from tmachine.utils.camera import Camera, camera_from_euler, camera_from_fov
+from tmachine.utils.camera import (
+    Camera,
+    camera_from_euler,
+    camera_from_fov,
+    camera_from_colmap,
+    auto_consistency_cameras,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +253,102 @@ class TestCameraRepr(unittest.TestCase):
         self.assertIsInstance(s, str)
         self.assertIn("640", s)
         self.assertIn("480", s)
+
+
+# ---------------------------------------------------------------------------
+# camera_from_colmap
+# ---------------------------------------------------------------------------
+
+class TestCameraFromColmap(unittest.TestCase):
+
+    def test_identity_rotation_zero_translation(self):
+        """R=I, t=0 → position at world origin."""
+        R = np.eye(3, dtype=np.float32)
+        t = np.zeros(3, dtype=np.float32)
+        cam = camera_from_colmap(R=R, t=t, fx=500, fy=500, cx=320, cy=240,
+                                 width=640, height=480)
+        np.testing.assert_allclose(cam.position, [0, 0, 0], atol=1e-6)
+        np.testing.assert_allclose(cam.R, R, atol=1e-6)
+
+    def test_translation_recovers_position(self):
+        """t = -(R @ pos) → camera_from_colmap must recover pos from t."""
+        R   = np.eye(3, dtype=np.float32)
+        pos = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        t   = -(R @ pos)
+        cam = camera_from_colmap(R=R, t=t, fx=500, fy=500, cx=320, cy=240,
+                                 width=640, height=480)
+        np.testing.assert_allclose(cam.position, pos, atol=1e-6)
+
+    def test_non_identity_rotation(self):
+        """Rotation matrix is stored as-is (world-to-camera convention)."""
+        R = np.array([[0, 0, 1],
+                      [0, 1, 0],
+                      [-1, 0, 0]], dtype=np.float32)
+        t = np.zeros(3, dtype=np.float32)
+        cam = camera_from_colmap(R=R, t=t, fx=500, fy=500, cx=320, cy=240,
+                                 width=640, height=480)
+        np.testing.assert_allclose(cam.R, R, atol=1e-6)
+
+    def test_intrinsics_preserved(self):
+        cam = camera_from_colmap(R=np.eye(3), t=np.zeros(3),
+                                 fx=800, fy=750, cx=310, cy=235,
+                                 width=640, height=480)
+        self.assertAlmostEqual(cam.fx,     800.0)
+        self.assertAlmostEqual(cam.fy,     750.0)
+        self.assertAlmostEqual(cam.cx,     310.0)
+        self.assertAlmostEqual(cam.cy,     235.0)
+        self.assertEqual(cam.width,  640)
+        self.assertEqual(cam.height, 480)
+
+
+# ---------------------------------------------------------------------------
+# auto_consistency_cameras
+# ---------------------------------------------------------------------------
+
+class TestAutoConsistencyCameras(unittest.TestCase):
+
+    def test_returns_correct_count(self):
+        primary = _default_cam()
+        cams = auto_consistency_cameras(primary, count=4)
+        self.assertEqual(len(cams), 4)
+
+    def test_single_camera(self):
+        primary = _default_cam()
+        cams = auto_consistency_cameras(primary, count=1)
+        self.assertEqual(len(cams), 1)
+
+    def test_intrinsics_match_primary(self):
+        primary = _default_cam(width=800, height=600)
+        for cam in auto_consistency_cameras(primary, count=4):
+            self.assertEqual(cam.width,  primary.width)
+            self.assertEqual(cam.height, primary.height)
+            self.assertAlmostEqual(cam.fx, primary.fx)
+            self.assertAlmostEqual(cam.fy, primary.fy)
+
+    def test_position_matches_primary(self):
+        """Consistency cameras rotate orientation, not position."""
+        primary = _default_cam()
+        for cam in auto_consistency_cameras(primary, count=4):
+            np.testing.assert_allclose(cam.position, primary.position, atol=1e-6)
+
+    def test_rotation_differs_from_primary(self):
+        """Each consistency camera must have a different yaw than the primary."""
+        primary = _default_cam()
+        for cam in auto_consistency_cameras(primary, count=4):
+            self.assertFalse(
+                np.allclose(cam.R, primary.R, atol=1e-5),
+                msg="Consistency camera should have a different rotation from primary.",
+            )
+
+    def test_cameras_alternate_left_right(self):
+        """With a 30° step the first two cameras should differ by ~60°."""
+        primary = _default_cam()
+        cams = auto_consistency_cameras(primary, count=2, yaw_step_deg=30.0)
+        # Both cameras should differ from each other (opposite yaw signs)
+        self.assertFalse(
+            np.allclose(cams[0].R, cams[1].R, atol=1e-5),
+            msg="First two consistency cameras should not be identical.",
+        )
 
 
 if __name__ == "__main__":

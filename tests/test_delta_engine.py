@@ -179,5 +179,44 @@ class TestDeltaEngineWeights(unittest.TestCase):
         self.assertAlmostEqual(lm.total_loss.item(), lm.l2_loss.item(), places=6)
 
 
+class TestDeltaEngineMaskDilation(unittest.TestCase):
+    """mask_dilation > 0 must expand the change_mask beyond the changed pixel."""
+
+    def test_dilation_expands_mask(self):
+        """Single changed pixel with dilation=2 → more than 1 pixel flagged."""
+        engine   = DeltaEngine(change_threshold=0.05, mask_dilation=2)
+        original = _img(16, 16, fill=0.0)
+        edited   = original.clone()
+        edited[8, 8, :] = 1.0
+        lm = engine.compute(original, edited)
+        self.assertGreater(
+            lm.change_mask.sum().item(), 1,
+            msg="Dilation should flag more than the single changed pixel.",
+        )
+
+    def test_zero_dilation_matches_default(self):
+        """mask_dilation=0 must produce the same mask as the default engine."""
+        engine_default = DeltaEngine(change_threshold=0.05)
+        engine_zero    = DeltaEngine(change_threshold=0.05, mask_dilation=0)
+        original = _img(8, 8, fill=0.0)
+        edited   = original.clone()
+        edited[4, 4, :] = 1.0
+        lm_default = engine_default.compute(original, edited)
+        lm_zero    = engine_zero.compute(original, edited)
+        self.assertTrue(
+            (lm_default.change_mask == lm_zero.change_mask).all(),
+            msg="mask_dilation=0 should match the default (no dilation) behaviour.",
+        )
+
+    def test_dilation_preserves_original_flagged_pixel(self):
+        """The pixel that triggered the mask must remain True after dilation."""
+        engine   = DeltaEngine(change_threshold=0.05, mask_dilation=1)
+        original = _img(8, 8, fill=0.0)
+        edited   = original.clone()
+        edited[4, 4, :] = 1.0
+        lm = engine.compute(original, edited)
+        self.assertTrue(lm.change_mask[4, 4].item())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -63,6 +63,30 @@ _BACKEND_URL      = os.environ.get("CELERY_RESULT_BACKEND", _BROKER_URL)
 _LOCK_TIMEOUT     = int(os.environ.get("LOCK_TIMEOUT", "300"))
 _PREVIEW_DIR      = Path(os.environ.get("PREVIEW_DIR", "./previews"))
 
+# ---------------------------------------------------------------------------
+# Scene LRU cache
+# ---------------------------------------------------------------------------
+# Avoids re-parsing the source .ply file for consecutive bake jobs on the same
+# scene.  Keyed by (absolute_path, mtime) so stale entries auto-invalidate when
+# the file changes on disk.  Cache is not thread-safe; safe under Celery’s
+# default --concurrency=1 (single worker thread).
+
+_SCENE_CACHE_MAX: int = int(os.environ.get("SCENE_CACHE_SIZE", "4"))
+_scene_cache: dict[tuple[str, float], Any] = {}
+
+
+def _load_scene_cached(path: str) -> Any:
+    """Return a GaussianCloud for *path*, loading from disk only when necessary."""
+    from ..io.ply_handler import load_ply
+    mtime = os.path.getmtime(path)
+    key = (path, mtime)
+    if key not in _scene_cache:
+        # Evict oldest entry (dict preserves insertion order since Python 3.7)
+        while len(_scene_cache) >= _SCENE_CACHE_MAX:
+            _scene_cache.pop(next(iter(_scene_cache)))
+        _scene_cache[key] = load_ply(path)
+    return _scene_cache[key]
+
 celery_app = Celery(
     "tmachine",
     broker=_BROKER_URL,
@@ -256,13 +280,17 @@ def bake_patch(
     try:
         with FileLock(lock_path, timeout=_LOCK_TIMEOUT):
             logger.info("Baking patch → %s", patch_out)
-            mutator = SplatMutator(scene)
+            mutator = SplatMutator(_load_scene_cached(scene))
             result  = mutator.mutate(
                 camera=camera,
                 edited_image=edited_tensor,
                 n_iters=n_iters,
                 patch_path=patch_out,
                 sh_degree=sh_degree,
+                on_iter=lambda i, loss_val: self.update_state(
+                    state="PROGRESS",
+                    meta={"iter": i, "loss": loss_val, "n_iters": n_iters},
+                ),
             )
             logger.info("Bake complete: %s", result)
     except Timeout as exc:
