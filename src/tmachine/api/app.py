@@ -18,13 +18,17 @@ Starting the Celery worker (separate terminal)
 
 Environment variables (all optional)
 --------------------------------------
-REDIS_URL              Redis connection string.  Default: redis://localhost:6379/0
+CELERY_BROKER_URL      Celery broker URL.  Default: redis://localhost:6379/0 (via REDIS_URL fallback)
+CELERY_RESULT_BACKEND  Celery result backend.  Defaults to CELERY_BROKER_URL.
+REDIS_URL              Legacy fallback for CELERY_BROKER_URL / CELERY_RESULT_BACKEND.
 TMACHINE_IP2P_MODEL    InstructPix2Pix model ID or local path.
 TMACHINE_WHISPER_MODEL Whisper model size (tiny|base|small|medium|large).
 OPENAI_API_KEY         Required for LLM prompt extraction in the voice pipeline.
 LOCK_TIMEOUT           Max seconds to wait for a .ply file lock.  Default: 300
 TMACHINE_CORS_ORIGINS  Comma-separated list of allowed CORS origins.
-                       Default: * (open).  Example: https://app.example.com,https://preview.example.com
+                       Default: * (open, credentials disabled).
+                       Example: https://app.example.com,https://preview.example.com
+                       Note: allow_credentials is only enabled when explicit origins are set.
 
 API overview
 ------------
@@ -88,11 +92,14 @@ _cors_origins: list[str] = (
     if _cors_env
     else ["*"]
 )
+# allow_credentials=True requires explicit origins (not "*") per the CORS spec.
+# Browsers will reject credentialed requests when the origin is a wildcard.
+_allow_credentials = _cors_origins != ["*"]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials=True,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

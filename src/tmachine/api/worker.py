@@ -29,10 +29,16 @@ scene is never written — each patch is a brand-new file.
 
 Environment variables
 ---------------------
-REDIS_URL         – Redis connection string.  Default: redis://localhost:6379/0
-DATABASE_URL      – PostgreSQL DSN.  Default: postgresql+psycopg2://...
-LOCK_TIMEOUT      – Max seconds to wait for a file lock.  Default: 300
-PREVIEW_DIR       – Directory for storing 2D preview PNGs.  Default: ./previews
+CELERY_BROKER_URL    – Celery broker URL.  Default: redis://localhost:6379/0
+                       Examples: redis://host:6379/0  |  amqp://user:pass@host//
+CELERY_RESULT_BACKEND– Celery result backend URL.  Defaults to CELERY_BROKER_URL.
+                       Can differ from the broker (e.g. RabbitMQ broker + Redis store).
+REDIS_URL            – Legacy: used as fallback for both broker and backend when
+                       CELERY_BROKER_URL / CELERY_RESULT_BACKEND are not set.
+DATABASE_URL         – Any SQLAlchemy-compatible DSN.
+                       Default: postgresql+psycopg2://tmachine:tmachine@localhost:5432/tmachine
+LOCK_TIMEOUT         – Max seconds to wait for a file lock.  Default: 300
+PREVIEW_DIR          – Directory for storing 2D preview PNGs.  Default: ./previews
 """
 
 from __future__ import annotations
@@ -51,14 +57,16 @@ from celery.utils.log import get_task_logger
 # Celery application
 # ---------------------------------------------------------------------------
 
-_REDIS_URL    = os.environ.get("REDIS_URL",    "redis://localhost:6379/0")
-_LOCK_TIMEOUT = int(os.environ.get("LOCK_TIMEOUT", "300"))
-_PREVIEW_DIR  = Path(os.environ.get("PREVIEW_DIR", "./previews"))
+_REDIS_FALLBACK   = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_BROKER_URL       = os.environ.get("CELERY_BROKER_URL",     _REDIS_FALLBACK)
+_BACKEND_URL      = os.environ.get("CELERY_RESULT_BACKEND", _BROKER_URL)
+_LOCK_TIMEOUT     = int(os.environ.get("LOCK_TIMEOUT", "300"))
+_PREVIEW_DIR      = Path(os.environ.get("PREVIEW_DIR", "./previews"))
 
 celery_app = Celery(
     "tmachine",
-    broker=_REDIS_URL,
-    backend=_REDIS_URL,
+    broker=_BROKER_URL,
+    backend=_BACKEND_URL,
 )
 
 celery_app.conf.update(

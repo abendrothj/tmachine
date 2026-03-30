@@ -77,8 +77,9 @@ jobs:
       - name: Install CPU PyTorch
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      # psycopg2 (in [db]) needs the PostgreSQL client headers to build from
-      # source.  The binary wheel sidesteps this for CI runners.
+      # A database driver is required but not included in [db] (users choose their
+      # own adapter).  psycopg2-binary provides a pre-compiled wheel for CI runners
+      # so we don't need the PostgreSQL client headers.
       - name: Install psycopg2 binary for CI
         run: pip install psycopg2-binary
 

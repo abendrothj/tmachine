@@ -70,11 +70,11 @@ ai = ["tmachine[ai-image,ai-voice]"]
 
 # pip install -e ".[db]"  — SQLAlchemy models + Alembic migrations only
 #   Use this when embedding tmachine models into your own application's DB stack.
-#   Does NOT include a PostgreSQL driver — install your preferred adapter (e.g.
-#   psycopg2-binary for development, psycopg2 for production) separately.
+#   Does NOT include a database driver — install your preferred adapter separately,
+#   e.g.:  psycopg2-binary  (Postgres, dev)  |  psycopg2  (Postgres, prod)
+#           asyncpg  (Postgres async)         |  pymysql  (MySQL/MariaDB)
 db = [
     "sqlalchemy>=2.0.0,<3",
-    "psycopg2>=2.9.0",
     "alembic>=1.13.0",
 ]
 
