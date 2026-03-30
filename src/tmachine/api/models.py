@@ -51,7 +51,7 @@ class MutateImageRequest(BaseModel):
     """
     scene:       str            = Field(..., description="Absolute path to the source .ply file")
     camera:      CameraParams
-    output_path: Optional[str]  = Field(None, description="Destination .ply path (default: overwrite source)")
+    output_path: Optional[str]  = Field(None, description="Patch .ply output path (base scene is never modified)")
     n_iters:     int            = Field(300, ge=1, le=5000)
     sh_degree:   int            = Field(3,   ge=0, le=3)
 
@@ -68,7 +68,7 @@ class MutatePromptRequest(BaseModel):
     camera:      CameraParams
     prompt:      str            = Field(..., min_length=3, max_length=500,
                                         description="Edit instruction, e.g. 'change the awning to dark hunter green'")
-    output_path: Optional[str]  = Field(None)
+    output_path: Optional[str]  = Field(None, description="Patch .ply output path (base scene is never modified)")
     n_iters:     int            = Field(300, ge=1, le=5000)
     sh_degree:   int            = Field(3,   ge=0, le=3)
     image_guidance_scale: float = Field(1.5, ge=1.0, le=2.5)

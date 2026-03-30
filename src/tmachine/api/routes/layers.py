@@ -129,6 +129,8 @@ async def generate_preview_from_voice(
 
     from ..models import CameraParams
 
+    scene = validate_scene_path(scene)
+
     try:
         camera_dict = CameraParams(**json.loads(camera)).model_dump()
     except Exception as exc:
@@ -232,8 +234,19 @@ async def bake_layer(
             )
         image_bytes = await edited_image.read()
     else:
+        # Restrict server-side file reads to preview_dir to prevent arbitrary file access
+        safe_filename = Path(preview_path).name  # type: ignore[arg-type]
+        if safe_filename != Path(preview_path).name or "/" in safe_filename or "\\" in safe_filename:
+            raise HTTPException(status_code=400, detail="Invalid preview_path")
+        preview_file = _PREVIEW_DIR / safe_filename
         try:
-            image_bytes = Path(preview_path).read_bytes()  # type: ignore[arg-type]
+            # resolve() catches any residual symlink traversal
+            resolved = preview_file.resolve()
+            resolved.relative_to(_PREVIEW_DIR.resolve())
+        except (ValueError, OSError):
+            raise HTTPException(status_code=400, detail="preview_path is outside preview directory")
+        try:
+            image_bytes = resolved.read_bytes()
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="preview_path not found on disk")
 
