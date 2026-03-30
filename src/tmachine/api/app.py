@@ -23,6 +23,8 @@ TMACHINE_IP2P_MODEL    InstructPix2Pix model ID or local path.
 TMACHINE_WHISPER_MODEL Whisper model size (tiny|base|small|medium|large).
 OPENAI_API_KEY         Required for LLM prompt extraction in the voice pipeline.
 LOCK_TIMEOUT           Max seconds to wait for a .ply file lock.  Default: 300
+TMACHINE_CORS_ORIGINS  Comma-separated list of allowed CORS origins.
+                       Default: * (open).  Example: https://app.example.com,https://preview.example.com
 
 API overview
 ------------
@@ -41,6 +43,7 @@ GET  /health                  → {"status": "ok"}
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # Load .env from the project root if present (no-op if python-dotenv not installed)
@@ -76,12 +79,19 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------------------------
-# CORS (adjust origins for your production domain)
+# CORS
 # ---------------------------------------------------------------------------
+
+_cors_env = os.environ.get("TMACHINE_CORS_ORIGINS", "")
+_cors_origins: list[str] = (
+    [o.strip() for o in _cors_env.split(",") if o.strip()]
+    if _cors_env
+    else ["*"]
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten in production
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

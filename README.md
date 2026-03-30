@@ -117,6 +117,7 @@ image    = renderer.render(camera)   # (H, W, 3) float32 tensor, [0, 1]
 | `gaussians` | `GaussianCloud` | loaded scene | Override the scene to render |
 | `sh_degree` | `int` | `3` | SH degree (0–3). Lower = faster |
 | `background` | `tuple[float,float,float]` | `(0,0,0)` | RGB background colour |
+| `packed` | `bool` | `False` | Use gsplat's packed rasterisation kernel. Faster for spatially sparse scenes. Keep `False` during optimization (backprop through all Gaussians) |
 
 ---
 
@@ -144,6 +145,7 @@ loss_map.total_loss.backward()   # drive the optimizer
 |---|---|---|
 | `l1_weight` | `0.8` | Weight of L1 in `total_loss` |
 | `l2_weight` | `0.2` | Weight of L2 in `total_loss` |
+| `lpips_weight` | `0.0` | Weight of LPIPS perceptual loss. When non-zero, requires `pip install "tmachine[ai-image]"`. `l1_weight + l2_weight + lpips_weight` must equal `1.0` |
 | `change_threshold` | `0.01` | Min luminance delta to flag a pixel as changed |
 
 **`LossMap` fields**
@@ -155,7 +157,8 @@ loss_map.total_loss.backward()   # drive the optimizer
 | `change_mask` | `(H, W)` bool | Pixels that changed above threshold |
 | `l1_loss` | scalar | Mean absolute error |
 | `l2_loss` | scalar | Mean squared error |
-| `total_loss` | scalar | `0.8·L1 + 0.2·L2` — differentiable |
+| `lpips_loss` | scalar or `None` | Perceptual (LPIPS) loss. `None` when `lpips_weight=0` (default) |
+| `total_loss` | scalar | `0.8·L1 + 0.2·L2` (+ `lpips_weight·LPIPS`) — differentiable |
 | `changed_pixel_ratio` | `float` | Fraction of pixels flagged as changed |
 
 ---
@@ -184,9 +187,31 @@ result.patch_path      # tiny patch .ply
 result.hidden_indices  # list[int] — base-scene rows to suppress
 ```
 
+When the scene is already resident in memory (e.g. multiple mutations in one process), pass the `GaussianCloud` directly to skip the disk read:
+
+```python
+from tmachine.io import load_ply
+
+cloud   = load_ply("scene.ply", device="cuda")
+mutator = SplatMutator(cloud)
+```
+
 **Why SH + opacity only (by default)**
 
 Colour and appearance changes are encoded in Spherical Harmonic coefficients and opacity logits. Freezing geometry (positions, scales, rotations) preserves multi-view structural integrity. Pass `optimize_geometry=True` for structural edits.
+
+**`SplatMutator` constructor**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `scene` | `str \| GaussianCloud` | — | Path to source `.ply`, or an already-loaded `GaussianCloud` (skips disk I/O) |
+| `device` | `str` | auto | `"cuda"` or `"cpu"` |
+| `lr_sh` | `float` | `5e-4` | Adam learning rate for SH colour coefficients |
+| `lr_opacity` | `float` | `5e-4` | Adam learning rate for opacity logits |
+| `lr_geometry` | `float` | `1e-5` | Adam learning rate for positions / scales / rotations when `optimize_geometry=True` |
+| `scheduler_gamma` | `float` | `0.995` | Exponential LR decay per iteration — halves the LR ≈ every 1 000 steps |
+| `convergence_window` | `int` | `10` | Rolling window for early-stopping; stops when `max(window) − min(window) < convergence_threshold` |
+| `change_threshold` | `float` | `1e-3` | Per-splat L2 SH+opacity delta threshold for patch extraction. Lower = capture subtler shifts |
 
 **`mutate()` parameters**
 
@@ -199,8 +224,7 @@ Colour and appearance changes are encoded in Spherical Harmonic coefficients and
 | `sh_degree` | `int` | `3` | Must match the scene's training degree |
 | `optimize_geometry` | `bool` | `False` | Also optimize positions, scales, rotations |
 | `on_iter` | `callable` | `None` | Progress callback `fn(iter: int, loss: float)` |
-| `convergence_threshold` | `float` | `1e-7` | Early-stop when loss delta falls below this |
-| `change_threshold` | `float` | `1e-4` | Per-splat delta threshold for patch extraction |
+| `convergence_threshold` | `float` | `1e-7` | Early-stop when loss delta across the rolling window falls below this |
 
 **`MutationResult`**
 
@@ -218,7 +242,7 @@ Colour and appearance changes are encoded in Spherical Harmonic coefficients and
 
 ## AI Layer
 
-The AI layer is optional (`pip install tmachine[ai]`). Any 2D image editing pipeline can be substituted — the three core modules have no AI dependency.
+The AI layer is optional. Install only what you need: `pip install "tmachine[ai-image]"` for image generation, `pip install "tmachine[ai-voice]"` for voice input, or `pip install "tmachine[ai]"` for both. The three core modules have no AI dependency.
 
 ### Image Editor
 
@@ -270,6 +294,11 @@ pipeline = VoicePipeline(
     system_prompt="Your instructions here...",  # optional — override the default
 )
 
+# Plug in any LLM provider instead of OpenAI (Anthropic, Ollama, fine-tuned model …):
+pipeline = VoicePipeline(
+    llm_fn=lambda transcript: my_anthropic_client.extract(transcript)
+)
+
 # From a file:
 result = pipeline.process_file("recording.m4a")
 print(result.transcript)    # full Whisper transcription
@@ -279,6 +308,16 @@ print(result.llm_used)      # True if LLM was called
 # From raw bytes (e.g. HTTP multipart upload):
 result = pipeline.process_bytes(audio_bytes, suffix=".webm")
 ```
+
+**`VoicePipeline` constructor**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `whisper_model` | `str` | `"base"` | Whisper model size. Overrides `TMACHINE_WHISPER_MODEL`. Options: `tiny` / `base` / `small` / `medium` / `large` |
+| `openai_api_key` | `str` | env | Override `OPENAI_API_KEY`. Ignored when `llm_fn` is provided |
+| `llm_model` | `str` | `"gpt-4o-mini"` | OpenAI model for prompt extraction. Ignored when `llm_fn` is provided |
+| `system_prompt` | `str` | built-in | System prompt for the LLM step. Override to specialise for your domain. Ignored when `llm_fn` is provided |
+| `llm_fn` | `Callable[[str], str]` | `None` | Drop-in replacement for the entire LLM step. Called with the raw transcript; must return the edit prompt. Use to plug in Anthropic, Ollama, or any other provider without subclassing |
 
 | Env var | Default | Description |
 |---|---|---|
@@ -615,11 +654,15 @@ Then install the package:
 # Core engine only (rendering + optimization, no AI, no API)
 pip install tmachine
 
-# With AI generation layer
-pip install "tmachine[ai]"
+# AI layer — pick what you need:
+pip install "tmachine[ai-image]"   # InstructPix2Pix / HuggingFace image editing
+pip install "tmachine[ai-voice]"   # Whisper STT + LLM prompt extraction
+pip install "tmachine[ai]"         # both (convenience alias)
 
-# With REST API server
-pip install "tmachine[api]"
+# API server — pick what you need:
+pip install "tmachine[db]"         # SQLAlchemy + Alembic only (embed in your own DB stack)
+pip install "tmachine[server]"     # full FastAPI + Celery server
+pip install "tmachine[api]"        # alias for [server] (backwards-compatible)
 
 # Everything
 pip install "tmachine[full]"
@@ -644,6 +687,7 @@ pip install -e ".[full,dev]"
 | `DATABASE_URL` | `postgresql+psycopg2://tmachine:tmachine@localhost:5432/tmachine` | PostgreSQL DSN |
 | `PREVIEW_DIR` | `./previews` | Directory where preview PNGs are saved |
 | `LOCK_TIMEOUT` | `300` | Seconds to wait for a `.ply` file lock |
+| `TMACHINE_CORS_ORIGINS` | `*` | Comma-separated list of allowed CORS origins (e.g. `https://app.example.com,https://admin.example.com`). Defaults to `*` (all origins). Restrict in production |
 | `TMACHINE_SCENE_ROOT` | — | Restrict `.ply` access to a directory (recommended in production) |
 | `TMACHINE_RENDERER_CACHE_SIZE` | `8` | Max scenes held in GPU memory by the render cache |
 

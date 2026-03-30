@@ -61,7 +61,7 @@ def pil_to_tensor(img: Image.Image) -> torch.Tensor:
 def main() -> None:
     parser = argparse.ArgumentParser(description="TMachine end-to-end edit demo")
     parser.add_argument("--ply",    required=True,              help="Source .ply file")
-    parser.add_argument("--out",    default="scene_edited.ply", help="Output .ply file")
+    parser.add_argument("--out",    default="scene_patch.ply",  help="Patch .ply output path (base scene is unchanged)")
     parser.add_argument("--width",  type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
     parser.add_argument("--iters",  type=int, default=300,      help="Optimisation iterations")
@@ -162,17 +162,16 @@ def main() -> None:
         camera=camera,
         edited_image=edited_tensor,
         n_iters=args.iters,
-        output_path=args.out,
+        patch_path=args.out,
         on_iter=on_iter,
     )
     print(f"\n[M3] Done — {result}")
-
-    # ── Verify: re-render the mutated scene ─────────────────────────────────
-    print("\n[verify] Re-rendering mutated scene…")
-    renderer_new = tmachine.ViewportRenderer(args.out)
-    verification = renderer_new.render(camera)
-    tensor_to_pil(verification).save("render_verification.png")
-    print("     → render_verification.png")
+    print(f"     patch saved → {result.patch_path}")
+    print(f"     ({result.changed_splat_count} splats changed; "
+          f"loss {result.initial_loss:.4f} → {result.final_loss:.4f})")
+    print()
+    print("NOTE: the base .ply is unchanged.  Use the Memory Layers API")
+    print("      (tmachine[server]) to composite the patch for rendering.")
 
     print(f"\nEdit prompt applied: {effective_prompt!r}")
 

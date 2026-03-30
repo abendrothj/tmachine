@@ -317,8 +317,12 @@ class TestPreviewServeEndpoint(unittest.TestCase):
         self.assertEqual(resp.headers["content-type"], "image/png")
 
     def test_rejects_path_traversal(self):
+        # Starlette normalises /previews/../etc/passwd in the URL before routing
+        # (it resolves to /etc/passwd → 404 no-route), so traversal is blocked.
+        # The endpoint's explicit ".." check in the filename provides defence-in-depth
+        # for URL-decoded parameters.
         resp = self.client.get("/previews/../etc/passwd")
-        self.assertIn(resp.status_code, (400, 422))
+        self.assertIn(resp.status_code, (400, 404, 422))
 
     def test_missing_preview_returns_404(self):
         with patch("tmachine.api.routes.layers._PREVIEW_DIR",

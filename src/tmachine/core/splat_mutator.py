@@ -40,7 +40,13 @@ How it works (the back-prop loop)
 
 Interface
 ---------
+    # From a path (loads from disk once):
     mutator = SplatMutator("scene.ply")
+
+    # From an already-loaded GaussianCloud (skips disk I/O):
+    cloud   = load_ply("scene.ply")
+    mutator = SplatMutator(cloud)
+
     result  = mutator.mutate(camera, edited_image, n_iters=300,
                              patch_path="patches/patch_abc.ply")
     # result.patch_path       — path to the saved patch .ply
@@ -119,14 +125,26 @@ class SplatMutator:
 
     Parameters
     ----------
-    ply_path : str
-        Source (base) .ply file.  Never modified directly.
+    scene : str | GaussianCloud
+        Source (base) scene.  Pass a ``str`` path to load from disk, or pass
+        a :class:`~tmachine.io.ply_handler.GaussianCloud` that is already in
+        memory to skip the disk read (useful when running multiple mutations on
+        the same scene in a single process).
     device : str, optional
         Torch device.  Defaults to CUDA when available.
     lr_sh : float
         Adam learning rate for Spherical Harmonic colour coefficients.
     lr_opacity : float
         Adam learning rate for raw opacity logits.
+    lr_geometry : float
+        Adam learning rate for position / scale / rotation when
+        ``optimize_geometry=True`` is passed to :meth:`mutate`.
+    scheduler_gamma : float
+        Exponential LR decay factor applied every iteration.
+        Default 0.995 — halves the LR roughly every 1 000 steps.
+    convergence_window : int
+        Rolling window size for early-stopping.  Stop when
+        ``max(window) - min(window) < convergence_threshold``.
     change_threshold : float
         Minimum L2 norm of the SH-DC delta (per splat, summed across RGB)
         for a splat to be considered changed.  Tune lower to capture subtle
@@ -135,24 +153,40 @@ class SplatMutator:
 
     def __init__(
         self,
-        ply_path: str,
+        scene: "str | GaussianCloud",
         device: Optional[str] = None,
         lr_sh: float = 5e-4,
         lr_opacity: float = 5e-4,
+        lr_geometry: float = 1e-5,
+        scheduler_gamma: float = 0.995,
+        convergence_window: int = 10,
         change_threshold: float = 1e-3,
     ) -> None:
-        self.ply_path         = Path(ply_path)
         self.device           = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.lr_sh            = lr_sh
         self.lr_opacity       = lr_opacity
+        self.lr_geometry      = lr_geometry
+        self.scheduler_gamma  = scheduler_gamma
+        self.convergence_window = convergence_window
         self.change_threshold = change_threshold
 
         self._renderer     = ViewportRenderer(device=self.device)
         self._delta_engine = DeltaEngine()
-        self._source: GaussianCloud = load_ply(str(self.ply_path), device=self.device)
+
+        if isinstance(scene, GaussianCloud):
+            self.ply_path = None
+            self._source  = scene.to(self.device)
+        else:
+            self.ply_path = Path(scene)
+            self._source  = load_ply(str(self.ply_path), device=self.device)
 
     def reload(self) -> None:
-        """Re-read the source .ply from disk (useful after external changes)."""
+        """Re-read the source .ply from disk (only valid when constructed with a path)."""
+        if self.ply_path is None:
+            raise RuntimeError(
+                "reload() is not available when SplatMutator was constructed from a "
+                "GaussianCloud directly.  Pass a ply_path string to enable reloading."
+            )
         self._source = load_ply(str(self.ply_path), device=self.device)
 
     # ------------------------------------------------------------------
@@ -272,10 +306,17 @@ class SplatMutator:
         # ── Default patch path ─────────────────────────────────────────────
         if patch_path is None:
             import uuid
-            patch_path = str(
-                self.ply_path.parent
-                / f"{self.ply_path.stem}_patch_{uuid.uuid4().hex[:8]}.ply"
-            )
+            hex8 = uuid.uuid4().hex[:8]
+            if self.ply_path is not None:
+                patch_path = str(
+                    self.ply_path.parent
+                    / f"{self.ply_path.stem}_patch_{hex8}.ply"
+                )
+            else:
+                import tempfile
+                patch_path = str(
+                    Path(tempfile.gettempdir()) / f"tmachine_patch_{hex8}.ply"
+                )
 
         # ── Clone source — never mutate the cached original ────────────────
         g = self._source.clone().to(self.device)
@@ -297,9 +338,9 @@ class SplatMutator:
             geo_log_scales = g.log_scales.detach().clone().requires_grad_(True)
             geo_quats      = g.quats.detach().clone().requires_grad_(True)
             optim_groups += [
-                {"params": [geo_means],      "lr": 1e-5},
-                {"params": [geo_log_scales], "lr": 1e-5},
-                {"params": [geo_quats],      "lr": 1e-5},
+                {"params": [geo_means],      "lr": self.lr_geometry},
+                {"params": [geo_log_scales], "lr": self.lr_geometry},
+                {"params": [geo_quats],      "lr": self.lr_geometry},
             ]
         else:
             geo_means      = g.means
@@ -308,7 +349,7 @@ class SplatMutator:
 
         # ── Optimizer + LR schedule ────────────────────────────────────────
         optimizer = optim.Adam(optim_groups, eps=1e-8)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.995)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.scheduler_gamma)
 
         # ── Optimisation loop ──────────────────────────────────────────────
         loss_history: list[float] = []
@@ -361,10 +402,9 @@ class SplatMutator:
             if on_iter is not None:
                 on_iter(i, loss_val)
 
-            # Rolling-window convergence check (last 10 steps all quiet)
-            _CONV_WINDOW = 10
-            if len(loss_history) >= _CONV_WINDOW:
-                window = loss_history[-_CONV_WINDOW:]
+            # Rolling-window convergence check
+            if len(loss_history) >= self.convergence_window:
+                window = loss_history[-self.convergence_window:]
                 if max(window) - min(window) < convergence_threshold:
                     break
 

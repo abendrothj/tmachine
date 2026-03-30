@@ -156,7 +156,7 @@ async def voice_edit(
     except ImportError as exc:
         raise HTTPException(
             status_code=503,
-            detail="Voice pipeline not installed. Run: pip install 'tmachine[ai]'",
+            detail="Voice pipeline not installed. Run: pip install 'tmachine[ai-voice]'",
         ) from exc
 
     # Validate camera JSON

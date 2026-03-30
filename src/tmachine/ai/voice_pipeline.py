@@ -21,6 +21,9 @@ Usage
 -----
     pipeline = VoicePipeline()
 
+    # With a custom domain-specific system prompt:
+    pipeline = VoicePipeline(system_prompt="You are an assistant that ...")
+
     # From a file on disk:
     result = pipeline.process_file("recording.m4a")
     print(result.transcript)     # full Whisper text
@@ -50,7 +53,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -94,30 +97,27 @@ class VoiceResult:
 # LLM system prompt
 # ---------------------------------------------------------------------------
 
-_EXTRACTION_SYSTEM_PROMPT = """
-You are a precise image editing assistant embedded in a historical preservation app.
+_DEFAULT_SYSTEM_PROMPT = """
+You are a precise image editing assistant.
 
-Your task is to interpret a user's spoken memory about how a place used to look and
-convert it into a single, clean image editing instruction suitable for an AI image
-editor (InstructPix2Pix / Stable Diffusion).
+Your task is to convert a user's spoken description into a single, clean image editing
+instruction suitable for an AI image editor (InstructPix2Pix / Stable Diffusion).
 
 Rules:
 1. Output ONLY the edit instruction — no preamble, no explanation, no quotes.
 2. Use imperative form: "Change X to Y", "Replace X with Y", "Make X look like Y".
-3. Be specific about colours, materials, and architectural features.
+3. Be specific about colours, materials, and visual features.
 4. If the user mentions multiple changes, pick only the single most prominent one.
 5. If the transcript is already a clean instruction, return it unchanged.
 
 Examples:
-  Input:  "Well, back in my day, that awning wasn't red at all, it was a dark hunter
-           green, almost forest-like."
+  Input:  "The awning was a dark hunter green, not red."
   Output: Change the awning color to dark hunter green
 
-  Input:  "That corner building used to have beautiful white marble columns,
-           not those ugly grey concrete ones they put in later."
+  Input:  "Those concrete columns used to be white marble."
   Output: Replace the concrete columns with white marble columns
 
-  Input:  "The whole facade was painted a warm terracotta, not this pale beige."
+  Input:  "The facade was warm terracotta, not this pale beige."
   Output: Change the building facade color from pale beige to warm terracotta
 """.strip()
 
@@ -138,9 +138,26 @@ class VoicePipeline:
         Options: tiny | base | small | medium | large  (default: base)
     openai_api_key : str, optional
         Override ``OPENAI_API_KEY`` env var for LLM extraction.
+        Ignored when ``llm_fn`` is provided.
     llm_model : str
-        OpenAI model to use for prompt extraction.  Default: gpt-4o-mini
-        (cheap, fast, and accurate enough for this structured task).
+        OpenAI model to use for prompt extraction.  Default: gpt-4o-mini.
+        Ignored when ``llm_fn`` is provided.
+    system_prompt : str, optional
+        System prompt sent to the LLM extraction step.  Defaults to a
+        domain-agnostic prompt.  Override to specialise the pipeline for
+        your own application domain.  Ignored when ``llm_fn`` is provided.
+    llm_fn : Callable[[str], str], optional
+        Drop-in replacement for the entire LLM extraction step.  Called
+        with the raw transcript and must return the edit prompt string.
+        Use this to plug in any provider (Anthropic, local Ollama, a
+        fine-tuned model, a simple regex, etc.) without subclassing::
+
+            pipeline = VoicePipeline(
+                llm_fn=lambda transcript: my_anthropic_client.extract(transcript)
+            )
+
+        When provided, ``openai_api_key``, ``llm_model``, and
+        ``system_prompt`` are ignored.
     """
 
     def __init__(
@@ -148,6 +165,8 @@ class VoicePipeline:
         whisper_model: Optional[str] = None,
         openai_api_key: Optional[str] = None,
         llm_model: str = "gpt-4o-mini",
+        system_prompt: Optional[str] = None,
+        llm_fn: Optional[Callable[[str], str]] = None,
     ) -> None:
         self.whisper_model_name = (
             whisper_model
@@ -157,6 +176,8 @@ class VoicePipeline:
             openai_api_key or os.environ.get("OPENAI_API_KEY", "")
         )
         self.llm_model = llm_model
+        self.system_prompt = system_prompt if system_prompt is not None else _DEFAULT_SYSTEM_PROMPT
+        self.llm_fn = llm_fn
         self._whisper_model = None  # lazy
 
     # ------------------------------------------------------------------
@@ -171,7 +192,7 @@ class VoicePipeline:
         except ImportError as exc:
             raise ImportError(
                 "openai-whisper is required for the voice pipeline.\n"
-                "Install with: pip install 'tmachine[ai]'"
+                "Install with: pip install 'tmachine[ai-voice]'"
             ) from exc
         self._whisper_model = whisper.load_model(self.whisper_model_name)
         return self._whisper_model
@@ -206,23 +227,28 @@ class VoicePipeline:
         -------
         (edit_prompt, llm_used)
         """
+        # ── Pluggable provider ────────────────────────────────────────────
+        if self.llm_fn is not None:
+            return self.llm_fn(transcript), True
+
+        # ── No API key — regex fallback ───────────────────────────────────
         if not self._openai_api_key:
-            # Fallback: return a lightly cleaned version of the transcript
             return self._regex_clean(transcript), False
 
+        # ── Default: OpenAI ───────────────────────────────────────────────
         try:
             from openai import OpenAI
         except ImportError as exc:
             raise ImportError(
                 "openai package is required for LLM extraction.\n"
-                "Install with: pip install 'tmachine[ai]'  or  pip install openai"
+                "Install with: pip install 'tmachine[ai-voice]'  or  pip install openai"
             ) from exc
 
         client = OpenAI(api_key=self._openai_api_key)
         response = client.chat.completions.create(
             model=self.llm_model,
             messages=[
-                {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
+                {"role": "system", "content": self.system_prompt},
                 {"role": "user",   "content": transcript},
             ],
             max_tokens=80,

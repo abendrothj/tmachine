@@ -182,13 +182,28 @@ def _apply_layers(
         tensors = [getattr(merged, attr)] + [getattr(p, attr) for p in patch_clouds]
         return torch.cat(tensors, dim=0)
 
+    # SH-degree normalisation — patches baked at different SH degrees have
+    # sh_rest shapes like (N, 15, 3) vs (M, 0, 3).  Pad smaller clouds with
+    # zeros so torch.cat doesn't raise a shape-mismatch RuntimeError.
+    all_clouds = [merged, *patch_clouds]
+    max_sh_rest = max(c.sh_rest.shape[1] for c in all_clouds)
+
+    def _pad_sh_rest(t: torch.Tensor) -> torch.Tensor:
+        deficit = max_sh_rest - t.shape[1]
+        if deficit == 0:
+            return t
+        pad = torch.zeros(t.shape[0], deficit, t.shape[2], dtype=t.dtype, device=t.device)
+        return torch.cat([t, pad], dim=1)
+
+    sh_rest_cat = torch.cat([_pad_sh_rest(c.sh_rest) for c in all_clouds], dim=0)
+
     return GaussianCloud(
         means=_cat("means"),
         quats=_cat("quats"),
         log_scales=_cat("log_scales"),
         raw_opacities=_cat("raw_opacities"),
         sh_dc=_cat("sh_dc"),
-        sh_rest=_cat("sh_rest"),
+        sh_rest=sh_rest_cat,
     )
 
 

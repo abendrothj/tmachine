@@ -81,6 +81,7 @@ class ViewportRenderer:
         gaussians: Optional[GaussianCloud] = None,
         sh_degree: int = 3,
         background: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        packed: bool = False,
     ) -> torch.Tensor:
         """
         Render the scene to a 2-D image.
@@ -96,6 +97,11 @@ class ViewportRenderer:
             Lower values are faster; 0 gives plain, direction-agnostic colours.
         background :
             RGB background colour, values in [0, 1].
+        packed :
+            Pass ``True`` to use gsplat's packed rasterisation kernel.
+            Faster for scenes with high spatial sparsity (many culled Gaussians).
+            Use ``False`` (default) for dense scenes or when gradients are
+            needed through all Gaussian parameters.
 
         Returns
         -------
@@ -148,7 +154,7 @@ class ViewportRenderer:
             backgrounds=bg,
             near_plane=camera.near,
             far_plane=camera.far,
-            packed=False,
+            packed=packed,
         )
 
         # renders: (1, H, W, 3) → (H, W, 3), clipped to [0, 1]

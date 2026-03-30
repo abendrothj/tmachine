@@ -132,6 +132,7 @@ class DeltaEngine:
         self.lpips_weight     = lpips_weight
         self.change_threshold = change_threshold
         self._lpips_fn        = None  # lazy-loaded
+        self._lpips_device: str | None = None
 
     def compute(
         self,
@@ -205,7 +206,7 @@ class DeltaEngine:
         Compute LPIPS perceptual distance between two (H, W, 3) images.
 
         Lazy-loads the ``lpips`` model on the first call and caches it.
-        Requires ``pip install lpips`` (or ``pip install tmachine[ai]``).
+        Requires ``pip install lpips`` (or ``pip install tmachine[ai-image]``).
         """
         if self._lpips_fn is None:
             try:
@@ -217,9 +218,12 @@ class DeltaEngine:
                 ) from exc
             self._lpips_fn = _lpips_lib.LPIPS(net="alex", verbose=False)
             self._lpips_fn.eval()
+            self._lpips_device: str | None = None
 
-        device = original.device
-        self._lpips_fn = self._lpips_fn.to(device)  # type: ignore[assignment]
+        device = str(original.device)
+        if device != self._lpips_device:
+            self._lpips_fn = self._lpips_fn.to(device)  # type: ignore[assignment]
+            self._lpips_device = device
 
         # lpips expects (N, 3, H, W) in [-1, 1]
         def _to_lpips(t: torch.Tensor) -> torch.Tensor:

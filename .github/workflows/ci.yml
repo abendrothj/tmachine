@@ -7,13 +7,63 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    name: "Python ${{ matrix.python-version }}"
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Check formatting
+        run: ruff format --check .
+
+      - name: Lint
+        run: ruff check .
+
+  test:
+    name: Test / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    needs: lint
+
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tmachine
+          POSTGRES_PASSWORD: tmachine
+          POSTGRES_DB: tmachine
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tmachine"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg2://tmachine:tmachine@localhost:5432/tmachine
+      REDIS_URL: redis://localhost:6379/0
 
     steps:
       - uses: actions/checkout@v4
@@ -23,19 +73,24 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      # Install CPU-only PyTorch first so gsplat (a core dep) doesn't pull
-      # in a CUDA build — and so the install stays fast on hosted runners.
+      # Install CPU-only PyTorch so gsplat doesn't pull a CUDA build.
       - name: Install CPU PyTorch
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      # [dev]  → pytest, pytest-cov, httpx (TestClient transport)
-      # [api]  → fastapi, celery, sqlalchemy, etc. (needed for Tier-3 tests)
-      # AI extras are intentionally excluded: no GPU, no diffusers, no Whisper.
-      # Tier-2 (gsplat) tests auto-skip when gsplat can't compile CUDA kernels.
-      - name: Install package
-        run: pip install -e ".[dev,api]"
+      # psycopg2 (in [db]) needs the PostgreSQL client headers to build from
+      # source.  The binary wheel sidesteps this for CI runners.
+      - name: Install psycopg2 binary for CI
+        run: pip install psycopg2-binary
 
-      # -m "not gpu"  → skips any test explicitly tagged @pytest.mark.gpu
-      # Tier-2 tests skip themselves when gsplat extensions are unavailable.
+      # [dev]    → pytest, pytest-cov, httpx (TestClient transport)
+      # [server] → fastapi, celery, sqlalchemy, alembic, etc.
+      # AI extras excluded — no GPU, no diffusers, no Whisper on CI runners.
+      - name: Install package
+        run: pip install -e ".[dev,server]"
+
+      - name: Apply migrations
+        run: alembic upgrade head
+
+      # -m "not gpu"  → skips tests tagged @pytest.mark.gpu
       - name: Test
         run: pytest -m "not gpu" --cov=tmachine --cov-report=term-missing

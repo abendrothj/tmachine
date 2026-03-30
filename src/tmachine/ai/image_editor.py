@@ -95,7 +95,7 @@ class ImageEditor:
         except ImportError as exc:
             raise ImportError(
                 "diffusers is required for the AI image editor.\n"
-                "Install with: pip install 'tmachine[ai]'"
+                "Install with: pip install 'tmachine[ai-image]'"
             ) from exc
 
         dtype = (
@@ -159,6 +159,15 @@ class ImageEditor:
         -------
         PIL.Image.Image
             Edited image, same size as the input.
+
+        Notes
+        -----
+        InstructPix2Pix operates internally at 512 × 512 px.  The input is
+        downscaled before inference and the result is upscaled back with
+        LANCZOS.  For large viewport renders (e.g. 1920 × 1080) this means
+        the AI edit is detail-limited to 512 px — treat the output as a
+        directional preview suitable for the SplatMutator signal, not a
+        photorealistic full-resolution render.
         """
         self._load()
 

@@ -27,8 +27,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "torch>=2.0.0",
-    "gsplat>=1.0.0",
+    "torch>=2.0.0,<3",
+    "gsplat>=1.0.0,<2",
     "plyfile>=0.9",
     "numpy>=1.24.0",
     "Pillow>=10.0.0",
@@ -47,32 +47,54 @@ dev = [
     "httpx>=0.27.0",          # TestClient transport
 ]
 
-# pip install -e ".[ai]"
-ai = [
+# pip install -e ".[ai-image]"  — InstructPix2Pix / SDXL image editing
+#   transformers + accelerate are not imported directly but are required at
+#   runtime by diffusers' from_pretrained pipeline.
+#   lpips pulls in torchvision; required only when DeltaEngine(lpips_weight>0).
+ai-image = [
     "diffusers>=0.27.0",
     "transformers>=4.38.0",
     "accelerate>=0.27.0",
-    "openai-whisper>=20231117",
-    "openai>=1.0.0",
     "lpips>=0.1.4",
 ]
 
-# pip install -e ".[api]"
-api = [
+# pip install -e ".[ai-voice]"  — Whisper STT + LLM prompt extraction
+#   openai is only used for the default LLM extraction step; pass llm_fn= to bypass it.
+ai-voice = [
+    "openai-whisper>=20231117",
+    "openai>=1.0.0,<2",
+]
+
+# pip install -e ".[ai]"  — both image and voice (convenience alias)
+ai = ["tmachine[ai-image,ai-voice]"]
+
+# pip install -e ".[db]"  — SQLAlchemy models + Alembic migrations only
+#   Use this when embedding tmachine models into your own application's DB stack.
+#   Does NOT include a PostgreSQL driver — install your preferred adapter (e.g.
+#   psycopg2-binary for development, psycopg2 for production) separately.
+db = [
+    "sqlalchemy>=2.0.0,<3",
+    "psycopg2>=2.9.0",
+    "alembic>=1.13.0",
+]
+
+# pip install -e ".[server]"  — full FastAPI + Celery API server
+#   redis is provided transitively by celery[redis] — not listed separately.
+server = [
+    "tmachine[db]",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.27.0",
     "celery[redis]>=5.3.0",
-    "redis>=5.0.0",
     "python-multipart>=0.0.9",
     "filelock>=3.13.0",
-    "sqlalchemy>=2.0.0",
-    "psycopg2-binary>=2.9.0",
-    "alembic>=1.13.0",
     "python-dotenv>=1.0.0",
 ]
 
+# pip install -e ".[api]"  — backwards-compatible alias for [server]
+api = ["tmachine[server]"]
+
 # pip install -e ".[full]"
-full = ["tmachine[ai,api]"]
+full = ["tmachine[ai-image,ai-voice,server]"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

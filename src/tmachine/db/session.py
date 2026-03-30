@@ -15,7 +15,7 @@ Usage
 
     # In a FastAPI dependency:
     async def my_route(db: Session = Depends(get_db)):
-        proposals = db.query(MemoryProposal).all()
+        layers = db.query(MemoryLayer).all()
 
     # In a Celery task (sync):
     with SessionLocal() as db:
