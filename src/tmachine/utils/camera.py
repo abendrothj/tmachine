@@ -235,12 +235,24 @@ def camera_from_fov(
     fov_x : float
         Horizontal field of view in radians (e.g. math.radians(60)).
     All other parameters as per :func:`camera_from_euler`.
+
+    Notes
+    -----
+    For a standard square-pixel pinhole camera ``fx == fy``.  The vertical
+    FoV is not an independent degree of freedom — it is determined by
+    ``fov_x`` and the image aspect ratio:
+
+        fov_y = 2 * atan(tan(fov_x / 2) * height / width)
+
+    This is encoded automatically via the ``fov_y`` property.  If your
+    capture equipment has non-square pixels, use :func:`camera_from_euler`
+    directly and supply separate ``fx`` and ``fy`` values.
     """
     fx = width / (2.0 * math.tan(fov_x / 2.0))
     return camera_from_euler(
         position=position,
         pitch=pitch, yaw=yaw, roll=roll,
-        fx=fx, fy=fx,
+        fx=fx, fy=fx,  # square pixels: fx == fy
         width=width, height=height,
         cx=cx, cy=cy,
         near=near, far=far,

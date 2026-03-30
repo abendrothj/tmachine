@@ -140,6 +140,30 @@ class TestDeltaEngineLossMapShapes(unittest.TestCase):
         self.assertEqual(lm.luminance_diff.shape, (h, w))
         self.assertEqual(lm.change_mask.shape,    (h, w))
 
+    def test_masked_loss_is_scalar(self):
+        engine = DeltaEngine()
+        lm     = engine.compute(_img(4, 4, 0.0), _img(4, 4, 1.0))
+        self.assertEqual(lm.masked_loss.dim(), 0, "masked_loss must be a scalar tensor")
+
+    def test_masked_loss_less_equal_total_when_partial_change(self):
+        """When only some pixels changed, masked_loss should differ from total_loss."""
+        engine   = DeltaEngine(change_threshold=0.05)
+        original = _img(8, 8, fill=0.0)
+        edited   = original.clone()
+        # Change only one pixel significantly
+        edited[0, 0, :] = 1.0
+        lm = engine.compute(original, edited)
+        # masked_loss should be higher than total_loss (concentrated on one pixel)
+        self.assertGreater(lm.masked_loss.item(), lm.total_loss.item())
+
+    def test_masked_loss_falls_back_to_total_when_no_change(self):
+        """When change_mask is all False, masked_loss must equal total_loss."""
+        engine = DeltaEngine(change_threshold=1.0)  # nothing can exceed threshold
+        lm     = engine.compute(_img(4, 4, 0.0), _img(4, 4, 0.1))
+        self.assertAlmostEqual(
+            lm.masked_loss.item(), lm.total_loss.item(), places=6
+        )
+
 
 class TestDeltaEngineWeights(unittest.TestCase):
     """Adjusting l1/l2 weights must change total_loss proportionally."""

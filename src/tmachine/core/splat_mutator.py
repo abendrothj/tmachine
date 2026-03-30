@@ -55,6 +55,8 @@ Interface
 
 from __future__ import annotations
 
+import logging
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -202,6 +204,7 @@ class SplatMutator:
         final_means: torch.Tensor,
         final_log_scales: torch.Tensor,
         final_quats: torch.Tensor,
+        optimize_geometry: bool = False,
     ) -> tuple[GaussianCloud, list[int]]:
         """
         Compute per-splat deltas, threshold them, and return a patch cloud
@@ -220,6 +223,15 @@ class SplatMutator:
         # Include splats whose SH (DC or rest) or opacity changed past the threshold
         opacity_delta = (final_raw_opacities - source.raw_opacities.to(self.device)).abs()
         combined_delta = dc_delta + rest_delta + opacity_delta
+
+        # When geometry was optimised, also flag splats whose position, scale, or
+        # rotation changed — without this, a splat that moved but kept its colour
+        # would be silently dropped from the patch.
+        if optimize_geometry:
+            pos_delta   = (final_means     - source.means.to(self.device)).norm(dim=-1)
+            scale_delta = (final_log_scales - source.log_scales.to(self.device)).norm(dim=-1)
+            quat_delta  = (final_quats      - source.quats.to(self.device)).norm(dim=-1)
+            combined_delta = combined_delta + pos_delta + scale_delta + quat_delta
 
         mask = combined_delta > self.change_threshold        # (N,) bool
         indices = torch.where(mask)[0]                       # 1-D int64 tensor
@@ -433,7 +445,24 @@ class SplatMutator:
             final_means=final_means,
             final_log_scales=final_log_scales,
             final_quats=final_quats,
+            optimize_geometry=optimize_geometry,
         )
+
+        # ── Warn on silent convergence with no meaningful improvement ──────
+        # The rolling-window check can fire in the first few iterations when
+        # gradients are near-zero (sparse scene, low-contrast edit).  If the
+        # loss barely moved the user gets an empty patch and no explanation.
+        if len(loss_history) <= self.convergence_window:
+            improvement = initial_loss - loss_history[-1]
+            if initial_loss > 0 and improvement / initial_loss < 0.01:
+                warnings.warn(
+                    f"SplatMutator converged after only {len(loss_history)} iterations "
+                    f"with <1% loss improvement ({initial_loss:.5f} → {loss_history[-1]:.5f}). "
+                    "The edit may not have been baked into the scene.  "
+                    "Consider lowering change_threshold or increasing n_iters.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         # ── Persist patch to disk ──────────────────────────────────────────
         save_ply(patch_cloud, patch_path)

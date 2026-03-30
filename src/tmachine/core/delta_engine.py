@@ -57,6 +57,11 @@ class LossMap:
     total_loss : scalar
         Weighted combination: ``l1_weight * l1_loss + l2_weight * l2_loss``.
         This is the value you call ``.backward()`` on.
+    masked_loss : scalar
+        ``total_loss`` restricted to pixels flagged by ``change_mask``.
+        Better gradient signal for targeted edits — drives the optimizer to
+        focus on changed regions rather than penalising the whole frame.
+        Falls back to ``total_loss`` when no pixels are masked.
     changed_pixel_ratio : float
         Python float — fraction of pixels flagged by ``change_mask``.
     """
@@ -68,6 +73,7 @@ class LossMap:
     l2_loss:              torch.Tensor            # scalar
     lpips_loss:           Optional[torch.Tensor]  # scalar, None when LPIPS disabled
     total_loss:           torch.Tensor            # scalar  ← backward() target
+    masked_loss:          torch.Tensor            # scalar — loss restricted to changed pixels
     changed_pixel_ratio:  float
 
     def __repr__(self) -> str:
@@ -113,7 +119,10 @@ class DeltaEngine:
     """
 
     # ITU-R BT.601 luma weights (matches human perceptual brightness)
+    # Stored as float32 regardless of input dtype — fp16 rounding on these
+    # coefficients is large enough to corrupt the luminance diff meaningfully.
     _LUMA = (0.299, 0.587, 0.114)
+    _luma_tensor: Optional[torch.Tensor] = None  # cached per-device, always fp32
 
     def __init__(
         self,
@@ -133,6 +142,7 @@ class DeltaEngine:
         self.change_threshold = change_threshold
         self._lpips_fn        = None  # lazy-loaded
         self._lpips_device: str | None = None
+        self._luma_cache: dict[str, torch.Tensor] = {}  # device → fp32 luma tensor
 
     def compute(
         self,
@@ -167,10 +177,15 @@ class DeltaEngine:
         pixel_diff = (edited - original).abs()           # (H, W, 3)
 
         # ── Luminance-weighted magnitude ───────────────────────────────────
-        luma = torch.tensor(
-            self._LUMA, dtype=original.dtype, device=original.device
-        )
-        luminance_diff = (pixel_diff * luma).sum(dim=-1)  # (H, W)
+        # Always fp32 — fp16 rounding on the BT.601 weights is large enough
+        # to produce a noticeably wrong luminance mask.
+        dev = str(original.device)
+        if dev not in self._luma_cache:
+            self._luma_cache[dev] = torch.tensor(
+                self._LUMA, dtype=torch.float32, device=original.device
+            )
+        luma = self._luma_cache[dev]
+        luminance_diff = (pixel_diff.float() * luma).sum(dim=-1)  # (H, W) fp32
 
         # ── Change mask ────────────────────────────────────────────────────
         change_mask = luminance_diff > self.change_threshold  # (H, W) bool
@@ -179,6 +194,20 @@ class DeltaEngine:
         l1_loss = pixel_diff.mean()
         l2_loss = ((edited - original) ** 2).mean()
         total_loss = self.l1_weight * l1_loss + self.l2_weight * l2_loss
+
+        # ── Masked loss — restrict signal to changed pixels ────────────────
+        # This gives the optimizer a cleaner gradient: it pushes hard on the
+        # region that actually changed and doesn't waste capacity on pixels
+        # the AI left untouched.  Falls back to total_loss when mask is empty.
+        if change_mask.any():
+            mask3 = change_mask.unsqueeze(-1).expand_as(pixel_diff)  # (H, W, 3)
+            masked_pixel_diff = pixel_diff[mask3].view(-1, 3)
+            masked_diff_raw   = (edited - original)[mask3].view(-1, 3)
+            masked_l1 = masked_pixel_diff.mean()
+            masked_l2 = (masked_diff_raw ** 2).mean()
+            masked_loss = self.l1_weight * masked_l1 + self.l2_weight * masked_l2
+        else:
+            masked_loss = total_loss
 
         # ── Optional LPIPS perceptual loss ─────────────────────────────
         lpips_loss: Optional[torch.Tensor] = None
@@ -194,6 +223,7 @@ class DeltaEngine:
             l2_loss=l2_loss,
             lpips_loss=lpips_loss,
             total_loss=total_loss,
+            masked_loss=masked_loss,
             changed_pixel_ratio=change_mask.float().mean().item(),
         )
 

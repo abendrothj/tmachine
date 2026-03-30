@@ -72,10 +72,27 @@ class TestCameraFromFov(unittest.TestCase):
         )
         self.assertAlmostEqual(cam.fov_x, fov, places=5)
 
-    def test_fx_fy_equal_for_square_pixels(self):
-        """camera_from_fov uses fx=fy (square pixel assumption)."""
-        cam = _default_cam()
-        self.assertAlmostEqual(cam.fx, cam.fy, places=6)
+    def test_fx_fy_equal_square_pixels(self):
+        """camera_from_fov assumes square pixels: fx must equal fy."""
+        cam = _default_cam(width=1920, height=1080)  # 16:9 — still fx==fy
+        self.assertAlmostEqual(cam.fx, cam.fy, places=6,
+                               msg="camera_from_fov should set fx==fy (square pixels)")
+
+    def test_fov_y_derived_from_aspect_ratio(self):
+        """
+        For a non-square sensor fov_y must follow from fov_x and aspect ratio.
+        With square pixels: fov_y = 2*atan(tan(fov_x/2) * height/width).
+        """
+        fov_x = math.radians(60)
+        width, height = 1920, 1080
+        cam = camera_from_fov(
+            position=(0, 0, -5), pitch=0, yaw=0, roll=0,
+            fov_x=fov_x, width=width, height=height,
+        )
+        expected_fov_y = 2.0 * math.atan(math.tan(fov_x / 2.0) * height / width)
+        self.assertAlmostEqual(cam.fov_y, expected_fov_y, places=5)
+        # fov_y for a 16:9 sensor with 60° horizontal FoV is ~34°, not 60°
+        self.assertLess(cam.fov_y, fov_x)
 
     def test_fx_from_fov_formula(self):
         """fx = width / (2 * tan(fov_x / 2))."""
