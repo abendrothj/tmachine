@@ -12,14 +12,13 @@ All external dependencies are monkeypatched:
 
 Covers
 ------
-GET /render         — correct PNG response; handles missing-file 404
-GET /health         — always returns 200 {"status": "ok"}
-POST /proposals/prompt  — creates a pending proposal, returns job_id
-POST /proposals/{id}/vote  — increments yes/no counts
-POST /proposals/{id}/approve   — triggers bake task, returns job_id
-POST /proposals/{id}/reject    — marks rejected
-GET /layers         — returns layer list for a scene
-GET /status/{job_id}    — maps Celery state to response
+GET /render             — correct PNG response; handles missing-file 404
+GET /health             — always returns 200 {"status": "ok"}
+POST /previews/generate — enqueues generate_preview, returns job_id
+POST /layers/bake       — enqueues bake_patch from uploaded image, returns job_id
+GET  /layers            — returns layer list for a scene
+GET  /previews/{file}   — serves a saved preview PNG
+GET  /status/{job_id}   — maps Celery state to response
 """
 
 from __future__ import annotations
@@ -121,7 +120,6 @@ class TestRenderEndpoint(unittest.TestCase):
 
         # Create a real temp .ply so the file-exists check passes
         from tmachine.io.ply_handler import GaussianCloud, save_ply
-        rng = np.random.default_rng(0)
         n   = 5
         self._tmp_ply = tempfile.NamedTemporaryFile(suffix=".ply", delete=False)
         cloud = GaussianCloud(
@@ -158,7 +156,6 @@ class TestRenderEndpoint(unittest.TestCase):
             )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.headers["content-type"], "image/png")
-        # Validate the response is actually a decodable PNG
         img = Image.open(io.BytesIO(resp.content))
         self.assertEqual(img.mode, "RGB")
 
@@ -171,13 +168,53 @@ class TestRenderEndpoint(unittest.TestCase):
 
 
 @unittest.skipUnless(_FASTAPI_AVAILABLE, _SKIP_REASON)
-class TestProposalLifecycle(unittest.TestCase):
+class TestPreviewGenerateEndpoint(unittest.TestCase):
     """
-    POST /proposals/prompt  →  GET /proposals  →  vote  →  approve/reject
-    All Celery tasks are stubbed to avoid Redis + GPU.
+    POST /previews/generate — enqueues generate_preview, returns job_id.
     """
 
     def _make_fake_async_result(self, task_id: str = "fake-job-id"):
+        ar = MagicMock()
+        ar.id = task_id
+        ar.status = "PENDING"
+        ar.result = None
+        return ar
+
+    def setUp(self):
+        from tmachine.api.app import app
+        self.client = TestClient(app)
+
+    def test_generate_preview_returns_job_id(self):
+        fake_ar = self._make_fake_async_result()
+        with patch(
+            "tmachine.api.routes.layers.generate_preview.delay",
+            return_value=fake_ar,
+        ):
+            resp = self.client.post(
+                "/previews/generate",
+                data={
+                    "scene":  "/fake/scene.ply",
+                    "camera": json.dumps({
+                        "x": 0, "y": 0, "z": -5,
+                        "pitch": 0, "yaw": 0, "roll": 0,
+                        "fov_x": math.radians(60),
+                        "width": 64, "height": 64,
+                    }),
+                    "prompt": "change the awning to green",
+                },
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("job_id", resp.json())
+        self.assertEqual(resp.json()["job_id"], "fake-job-id")
+
+
+@unittest.skipUnless(_FASTAPI_AVAILABLE, _SKIP_REASON)
+class TestLayersBakeEndpoint(unittest.TestCase):
+    """
+    POST /layers/bake — enqueues bake_patch, returns job_id.
+    """
+
+    def _make_fake_async_result(self, task_id: str = "bake-job-id"):
         ar = MagicMock()
         ar.id = task_id
         ar.status = "PENDING"
@@ -192,164 +229,148 @@ class TestProposalLifecycle(unittest.TestCase):
         override_db  = _get_test_db_factory(self._engine)
         app.dependency_overrides[get_db] = override_db
 
+        # Need a real temp .ply for scene path validation
+        from tmachine.io.ply_handler import GaussianCloud, save_ply
+        n = 5
+        self._tmp_ply = tempfile.NamedTemporaryFile(suffix=".ply", delete=False)
+        cloud = GaussianCloud(
+            means=torch.zeros(n, 3),
+            quats=torch.tensor([[1,0,0,0]] * n, dtype=torch.float32),
+            log_scales=torch.full((n, 3), -3.0),
+            raw_opacities=torch.ones(n),
+            sh_dc=torch.zeros(n, 3),
+            sh_rest=torch.zeros(n, 15, 3),
+        )
+        save_ply(cloud, self._tmp_ply.name)
+
         self.client = TestClient(app)
-        self._app   = app
 
     def tearDown(self):
+        os.unlink(self._tmp_ply.name)
         from tmachine.api.app import app
         app.dependency_overrides.clear()
 
-    def _enqueue_proposal(self, scene: str = "/fake/scene.ply") -> dict:
+    def test_bake_with_uploaded_image_returns_job_id(self):
         fake_ar = self._make_fake_async_result()
         with patch(
-            "tmachine.api.routes.proposals.generate_memory_proposal.delay",
+            "tmachine.api.routes.layers.bake_patch.delay",
             return_value=fake_ar,
         ):
             resp = self.client.post(
-                "/proposals/prompt",
+                "/layers/bake",
                 data={
-                    "scene":  scene,
-                    "camera": json.dumps({
+                    "scene":        self._tmp_ply.name,
+                    "camera":       json.dumps({
                         "x": 0, "y": 0, "z": -5,
                         "pitch": 0, "yaw": 0, "roll": 0,
                         "fov_x": math.radians(60),
                         "width": 64, "height": 64,
                     }),
-                    "prompt": "change the awning to green",
+                    "external_ref": "proposal-42",
                 },
+                files={"edited_image": ("edit.png", _white_png_bytes(), "image/png")},
             )
-        return resp
-
-    def test_create_proposal_returns_job_id(self):
-        resp = self._enqueue_proposal()
         self.assertEqual(resp.status_code, 200)
-        body = resp.json()
-        self.assertIn("job_id", body)
-        self.assertEqual(body["job_id"], "fake-job-id")
+        self.assertEqual(resp.json()["job_id"], "bake-job-id")
 
-    def test_vote_yes_increments_count(self):
-        from tmachine.db.models import MemoryProposal, ProposalStatus
-        from sqlalchemy.orm import sessionmaker
+    def test_bake_requires_image_or_path(self):
+        resp = self.client.post(
+            "/layers/bake",
+            data={
+                "scene":  self._tmp_ply.name,
+                "camera": json.dumps({
+                    "x": 0, "y": 0, "z": -5,
+                    "pitch": 0, "yaw": 0, "roll": 0,
+                    "fov_x": math.radians(60),
+                    "width": 64, "height": 64,
+                }),
+            },
+        )
+        self.assertEqual(resp.status_code, 422)
 
-        # Insert a proposal directly into the test DB
-        Session = sessionmaker(bind=self._engine)
-        with Session() as db:
-            proposal = MemoryProposal(
-                scene="/fake/scene.ply",
-                prompt="test",
-                preview_path="",
-                status=ProposalStatus.PENDING,
-                votes_yes=0, votes_no=0,
-                cam_x=0, cam_y=0, cam_z=-5,
-                cam_pitch=0, cam_yaw=0, cam_roll=0,
-                cam_fov_x=math.radians(60),
-                cam_width=64, cam_height=64,
-            )
-            db.add(proposal)
-            db.commit()
-            db.refresh(proposal)
-            pid = proposal.id
 
-        resp = self.client.post(f"/proposals/{pid}/vote", data={"vote": "yes"})
-        self.assertEqual(resp.status_code, 200)
+@unittest.skipUnless(_FASTAPI_AVAILABLE, _SKIP_REASON)
+class TestPreviewServeEndpoint(unittest.TestCase):
+    """GET /previews/{filename} — serves a saved PNG."""
 
-        with Session() as db:
-            p = db.get(MemoryProposal, pid)
-            self.assertEqual(p.votes_yes, 1)
-            self.assertEqual(p.votes_no, 0)
+    def setUp(self):
+        from tmachine.api.app import app
+        self.client = TestClient(app)
+        self._tmp_dir = tempfile.mkdtemp()
 
-    def test_vote_no_increments_count(self):
-        from tmachine.db.models import MemoryProposal, ProposalStatus
-        from sqlalchemy.orm import sessionmaker
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
 
-        Session = sessionmaker(bind=self._engine)
-        with Session() as db:
-            proposal = MemoryProposal(
-                scene="/fake/scene.ply",
-                prompt="test",
-                preview_path="",
-                status=ProposalStatus.PENDING,
-                votes_yes=0, votes_no=0,
-                cam_x=0, cam_y=0, cam_z=-5,
-                cam_pitch=0, cam_yaw=0, cam_roll=0,
-                cam_fov_x=math.radians(60),
-                cam_width=64, cam_height=64,
-            )
-            db.add(proposal)
-            db.commit()
-            db.refresh(proposal)
-            pid = proposal.id
+    def test_serves_existing_preview(self):
+        # Write a real PNG to a temp preview dir
+        png_bytes = _white_png_bytes()
+        preview_file = os.path.join(self._tmp_dir, "preview_test.png")
+        with open(preview_file, "wb") as f:
+            f.write(png_bytes)
 
-        self.client.post(f"/proposals/{pid}/vote", data={"vote": "no"})
-
-        with Session() as db:
-            p = db.get(MemoryProposal, pid)
-            self.assertEqual(p.votes_no, 1)
-
-    def test_approve_proposal_enqueues_bake(self):
-        from tmachine.db.models import MemoryProposal, ProposalStatus
-        from sqlalchemy.orm import sessionmaker
-
-        Session = sessionmaker(bind=self._engine)
-        with Session() as db:
-            proposal = MemoryProposal(
-                scene="/fake/scene.ply",
-                prompt="change awning",
-                preview_path="/fake/preview.png",
-                status=ProposalStatus.PENDING,
-                votes_yes=3, votes_no=0,
-                cam_x=0, cam_y=0, cam_z=-5,
-                cam_pitch=0, cam_yaw=0, cam_roll=0,
-                cam_fov_x=math.radians(60),
-                cam_width=64, cam_height=64,
-            )
-            db.add(proposal)
-            db.commit()
-            db.refresh(proposal)
-            pid = proposal.id
-
-        bake_ar = self._make_fake_async_result("bake-job-id")
-        with patch(
-            "tmachine.api.routes.proposals.bake_approved_patch.delay",
-            return_value=bake_ar,
-        ) as mock_bake:
-            resp = self.client.post(f"/proposals/{pid}/approve")
+        with patch("tmachine.api.routes.layers._PREVIEW_DIR",
+                   __import__("pathlib").Path(self._tmp_dir)):
+            resp = self.client.get("/previews/preview_test.png")
 
         self.assertEqual(resp.status_code, 200)
-        mock_bake.assert_called_once()
+        self.assertEqual(resp.headers["content-type"], "image/png")
 
-        with Session() as db:
-            p = db.get(MemoryProposal, pid)
-            self.assertEqual(p.status, ProposalStatus.APPROVED)
+    def test_rejects_path_traversal(self):
+        resp = self.client.get("/previews/../etc/passwd")
+        self.assertIn(resp.status_code, (400, 422))
 
-    def test_reject_proposal(self):
-        from tmachine.db.models import MemoryProposal, ProposalStatus
-        from sqlalchemy.orm import sessionmaker
+    def test_missing_preview_returns_404(self):
+        with patch("tmachine.api.routes.layers._PREVIEW_DIR",
+                   __import__("pathlib").Path(self._tmp_dir)):
+            resp = self.client.get("/previews/does_not_exist.png")
+        self.assertEqual(resp.status_code, 404)
 
-        Session = sessionmaker(bind=self._engine)
-        with Session() as db:
-            proposal = MemoryProposal(
-                scene="/fake/scene.ply",
-                prompt="change awning",
-                preview_path="",
-                status=ProposalStatus.PENDING,
-                votes_yes=0, votes_no=5,
-                cam_x=0, cam_y=0, cam_z=-5,
-                cam_pitch=0, cam_yaw=0, cam_roll=0,
-                cam_fov_x=math.radians(60),
-                cam_width=64, cam_height=64,
-            )
-            db.add(proposal)
-            db.commit()
-            db.refresh(proposal)
-            pid = proposal.id
 
-        resp = self.client.post(f"/proposals/{pid}/reject")
+@unittest.skipUnless(_FASTAPI_AVAILABLE, _SKIP_REASON)
+class TestLayersListEndpoint(unittest.TestCase):
+    """GET /layers — returns MemoryLayer list for a scene."""
+
+    def setUp(self):
+        from tmachine.api.app import app
+        from tmachine.db.session import get_db
+
+        self._engine = _make_test_engine()
+        override_db  = _get_test_db_factory(self._engine)
+        app.dependency_overrides[get_db] = override_db
+        self.client = TestClient(app)
+        self._Session = sessionmaker(bind=self._engine)
+
+    def tearDown(self):
+        from tmachine.api.app import app
+        app.dependency_overrides.clear()
+
+    def test_empty_list_for_unknown_scene(self):
+        resp = self.client.get("/layers", params={"scene": "/no/scene.ply"})
         self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), [])
 
-        with Session() as db:
-            p = db.get(MemoryProposal, pid)
-            self.assertEqual(p.status, ProposalStatus.REJECTED)
+    def test_returns_layer_for_scene(self):
+        from tmachine.db.models import MemoryLayer
+        with self._Session() as db:
+            layer = MemoryLayer(
+                scene="/fake/scene.ply",
+                patch_path="/fake/patch.ply",
+                hidden_indices=[1, 2, 3],
+                changed_splat_count=3,
+                initial_loss=0.1,
+                final_loss=0.01,
+                iterations_run=300,
+                external_ref="proposal-1",
+            )
+            db.add(layer)
+            db.commit()
+
+        resp = self.client.get("/layers", params={"scene": "/fake/scene.ply"})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["external_ref"], "proposal-1")
 
 
 @unittest.skipUnless(_FASTAPI_AVAILABLE, _SKIP_REASON)
@@ -362,7 +383,7 @@ class TestJobStatusEndpoint(unittest.TestCase):
     def _mock_result(self, state: str, result=None):
         ar = MagicMock()
         ar.state  = state
-        ar.status = state   # route reads .status; Celery's .status == .state
+        ar.status = state
         ar.result = result
         ar.info   = result
         return ar
@@ -377,7 +398,7 @@ class TestJobStatusEndpoint(unittest.TestCase):
         self.assertEqual(resp.json()["status"], "PENDING")
 
     def test_success_status_includes_result(self):
-        payload = {"proposal_id": 7, "prompt": "green awning"}
+        payload = {"preview_filename": "preview_abc.png", "prompt": "green awning"}
         with patch(
             "tmachine.api.routes.mutate.AsyncResult",
             return_value=self._mock_result("SUCCESS", result=payload),
@@ -385,7 +406,7 @@ class TestJobStatusEndpoint(unittest.TestCase):
             resp = self.client.get("/status/some-job-id")
         body = resp.json()
         self.assertEqual(body["status"], "SUCCESS")
-        self.assertEqual(body["result"]["proposal_id"], 7)
+        self.assertEqual(body["result"]["preview_filename"], "preview_abc.png")
 
     def test_failure_status(self):
         with patch(

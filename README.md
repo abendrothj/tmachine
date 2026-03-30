@@ -37,13 +37,13 @@ result = mutator.mutate(
 - [Module 2 — Delta Engine](#module-2--delta-engine)
 - [Module 3 — Splat Mutator](#module-3--splat-mutator)
 - [AI Layer](#ai-layer)
-  - [Voice Pipeline](#voice-pipeline)
   - [Image Editor](#image-editor)
+  - [Voice Pipeline](#voice-pipeline)
 - [Scene I/O](#scene-io)
 - [Camera](#camera)
 - [REST API](#rest-api)
 - [Memory Layers](#memory-layers)
-- [Database models](#database-models)
+- [Database model](#database-model)
 - [Installation](#installation)
 - [Environment variables](#environment-variables)
 
@@ -220,43 +220,6 @@ Colour and appearance changes are encoded in Spherical Harmonic coefficients and
 
 The AI layer is optional (`pip install tmachine[ai]`). Any 2D image editing pipeline can be substituted — the three core modules have no AI dependency.
 
-### Voice Pipeline
-
-**`tmachine/ai/voice_pipeline.py`** · **`VoicePipeline`**
-
-Two-stage pipeline: Whisper STT → GPT-4o-mini prompt extraction.
-
-```
-Spoken:       "Well, back in my day that awning was never red —
-               it was a dark hunter green."
-Transcript:   (raw Whisper output)
-Edit prompt:  "Change the awning color to dark hunter green"
-```
-
-```python
-from tmachine.ai import VoicePipeline
-
-pipeline = VoicePipeline()
-
-# From a file:
-result = pipeline.process_file("recording.m4a")
-print(result.transcript)    # full Whisper transcription
-print(result.edit_prompt)   # extracted imperative instruction
-print(result.llm_used)      # True if GPT was called
-
-# From raw bytes (e.g. HTTP multipart upload):
-result = pipeline.process_bytes(audio_bytes, suffix=".webm")
-```
-
-When `OPENAI_API_KEY` is absent, a regex-based fallback cleans the transcript and returns it directly as the edit prompt.
-
-| Env var | Default | Description |
-|---|---|---|
-| `OPENAI_API_KEY` | — | Required for LLM extraction |
-| `TMACHINE_WHISPER_MODEL` | `base` | `tiny` / `base` / `small` / `medium` / `large` |
-
----
-
 ### Image Editor
 
 **`tmachine/ai/image_editor.py`** · **`ImageEditor`**
@@ -289,6 +252,38 @@ editor.unload()   # free VRAM before running SplatMutator
 |---|---|---|
 | `TMACHINE_IP2P_MODEL` | `timbrooks/instruct-pix2pix` | HuggingFace model ID or local path |
 | `TMACHINE_DEVICE` | auto | `cuda` / `mps` / `cpu` |
+
+---
+
+### Voice Pipeline
+
+**`tmachine/ai/voice_pipeline.py`** · **`VoicePipeline`**
+
+Two-stage pipeline: Whisper STT → LLM prompt extraction. The LLM step is optional — when `OPENAI_API_KEY` is absent a regex-based fallback returns a lightly cleaned transcript.
+
+```python
+from tmachine.ai import VoicePipeline
+
+pipeline = VoicePipeline(
+    whisper_model="base",
+    llm_model="gpt-4o-mini",         # any OpenAI-compatible model
+    system_prompt="Your instructions here...",  # optional — override the default
+)
+
+# From a file:
+result = pipeline.process_file("recording.m4a")
+print(result.transcript)    # full Whisper transcription
+print(result.edit_prompt)   # extracted imperative instruction
+print(result.llm_used)      # True if LLM was called
+
+# From raw bytes (e.g. HTTP multipart upload):
+result = pipeline.process_bytes(audio_bytes, suffix=".webm")
+```
+
+| Env var | Default | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | — | Required for LLM extraction |
+| `TMACHINE_WHISPER_MODEL` | `base` | `tiny` / `base` / `small` / `medium` / `large` |
 
 ---
 
@@ -401,21 +396,34 @@ curl "http://localhost:8000/render?scene=/data/s.ply&active_layers=3&active_laye
 
 ---
 
-### `POST /proposals/prompt`
+### `POST /previews/generate`
 
-Enqueue Stage 1 (render → AI edit → save preview PNG → write `MemoryProposal`). Returns immediately.
+Enqueue Stage 1: render → AI edit → save preview PNG. Returns immediately.
 
-**Form fields:** `scene`, `camera` (JSON), `prompt`
+**Form fields:** `scene`, `camera` (JSON), `prompt`, `image_guidance_scale` (default `1.5`), `guidance_scale` (default `7.5`), `seed` (optional), `sh_degree` (default `3`)
 
 ```json
 { "job_id": "abc123", "status": "PENDING" }
 ```
 
+Poll `GET /status/{job_id}` for the result:
+
+```json
+{
+  "status": "SUCCESS",
+  "result": {
+    "preview_filename": "preview_a1b2c3d4.png",
+    "preview_path": "/absolute/path/to/previews/preview_a1b2c3d4.png",
+    "prompt": "change the awning to dark hunter green"
+  }
+}
+```
+
 ---
 
-### `POST /proposals/voice`
+### `POST /previews/voice`
 
-Full Tap-and-Talk pipeline. Whisper + LLM run synchronously; AI generation runs in background.
+Full voice pipeline. Whisper + LLM run synchronously; AI generation runs in background.
 
 **Form fields:** `audio` (file), `scene`, `camera` (JSON)
 
@@ -431,38 +439,51 @@ Full Tap-and-Talk pipeline. Whisper + LLM run synchronously; AI generation runs 
 
 ---
 
-### `GET /proposals`
+### `GET /previews/{filename}`
 
-| Parameter | Default | Description |
+Serve a saved preview PNG from `PREVIEW_DIR`. `filename` must be a bare filename with no path separators.
+
+Response: `image/png`
+
+---
+
+### `POST /layers/bake`
+
+Enqueue Stage 2: bake an edited image into the 3D scene. The engine does not enforce any approval workflow — the caller decides when to trigger this.
+
+**Form fields:**
+
+| Field | Required | Description |
 |---|---|---|
-| `scene` | required | Filter by base `.ply` path |
-| `status` | `PENDING` | `PENDING` / `APPROVED` / `REJECTED` / `ALL` |
+| `scene` | yes | Absolute path to the base `.ply` |
+| `camera` | yes | JSON-encoded camera params |
+| `edited_image` | one of | Uploaded PNG/JPEG file |
+| `preview_path` | one of | Absolute path to a preview saved by the engine |
+| `external_ref` | no | Opaque caller reference (e.g. a proposal ID) — stored on the layer |
+| `n_iters` | no | Optimizer steps (default `300`) |
+| `sh_degree` | no | SH degree (default `3`) |
+| `patch_dir` | no | Output directory for the patch `.ply` |
 
----
+```json
+{ "job_id": "xyz789", "status": "PENDING" }
+```
 
-### `GET /proposals/{id}/preview`
+Poll `GET /status/{job_id}` for the result:
 
-Returns the 2D AI-edited preview PNG for a proposal.
-
----
-
-### `POST /proposals/{id}/vote`
-
-**Body:** `{ "vote": "yes" | "no" }`
-
----
-
-### `POST /proposals/{id}/approve`
-
-Marks approved and enqueues Stage 2 (`bake_approved_patch` — runs `SplatMutator`, writes a `MemoryLayer` row).
-
-**Body:** `{ "n_iters": 300 }`
-
----
-
-### `POST /proposals/{id}/reject`
-
-Marks rejected. No 3D mutation is performed.
+```json
+{
+  "status": "SUCCESS",
+  "result": {
+    "layer_id": 12,
+    "patch_path": "/data/patch_a1b2c3d4.ply",
+    "hidden_indices": [104, 892, 1203],
+    "changed_splat_count": 4821,
+    "initial_loss": 0.02341,
+    "final_loss": 0.00189,
+    "iterations_run": 247
+  }
+}
+```
 
 ---
 
@@ -472,6 +493,8 @@ Marks rejected. No 3D mutation is performed.
 |---|---|
 | `scene` | Filter by base `.ply` path |
 
+Returns a list of baked `MemoryLayer` objects for the scene.
+
 ---
 
 ### `GET /status/{job_id}`
@@ -480,11 +503,23 @@ Marks rejected. No 3D mutation is performed.
 {
   "job_id": "abc123",
   "status": "SUCCESS",
-  "result": { "proposal_id": 7, "preview_path": "...", "prompt": "..." }
+  "result": { ... }
 }
 ```
 
 Statuses: `PENDING` · `STARTED` · `SUCCESS` · `FAILURE` · `RETRY`
+
+---
+
+### Legacy mutation endpoints
+
+These endpoints run the full pipeline in one shot (no DB write, no layer record):
+
+- `POST /mutate/prompt` — render → AI edit → SplatMutator → patch file
+- `POST /mutate/image` — upload edited image → SplatMutator → patch file
+- `POST /voice-edit` — voice → Whisper + LLM → full pipeline
+
+Use these for programmatic one-off edits where you manage patch storage yourself.
 
 ---
 
@@ -494,12 +529,12 @@ Memory Layers is the Git-style patch system that enables branching, reversible, 
 
 ### Data model
 
-Each approved edit produces two artefacts:
+Each baked edit produces two artefacts:
 
 1. **Patch `.ply`** — a `GaussianCloud` containing only the changed splats (typically ≪ 1 % of the base scene).
 2. **`hidden_indices`** — the integer row indices in the base scene that the patch replaces.
 
-The base `.ply` is never modified.
+The base `.ply` is never modified. Each baked patch is recorded as a `MemoryLayer` row in the database.
 
 ### Layered rendering
 
@@ -510,37 +545,34 @@ When `GET /render?active_layers=3,7` is called:
 3. Concatenate the patch clouds onto the base.
 4. Rasterize the merged cloud.
 
-### Two-stage human review
+### Two-stage pipeline
 
-```
-User speaks / types
-       │
-       ▼
-Stage 1: generate_memory_proposal                       (~30–60 s)
-  Render → AI edit → save preview PNG → MemoryProposal(PENDING)
-  ← returns immediately with job_id
+The engine provides two primitives. Any approval workflow between them is the **caller's responsibility**.
 
-       │
-       ▼
-  Community votes YES / NO
-  Curator calls POST /proposals/{id}/approve
+```text
+Stage 1 — POST /previews/generate             (~30–60 s)
+  Render → AI edit → save preview PNG
+  Returns: { preview_filename, preview_path, prompt }
 
-       │
-       ▼
-Stage 2: bake_approved_patch                            (~2–5 min)
+  ← Caller manages preview, voting, approval logic →
+
+Stage 2 — POST /layers/bake                   (~2–5 min)
+  Caller supplies: scene + edited image + camera
   SplatMutator → patch.ply + hidden_indices → MemoryLayer row
   Base .ply untouched
 ```
 
-### Handling conflicting memories
+Pass `external_ref` to `/layers/bake` to link a layer back to whatever ID your upstream system uses.
 
-Two people may remember the same corner differently. Both proposals are stored as discrete `MemoryLayer` rows. The frontend's layer toggle allows switching between competing historical realities as a first-class feature.
+### Handling conflicting edits
+
+Two callers may bake conflicting changes to the same scene region. Both patches are stored as discrete `MemoryLayer` rows. The render endpoint composites whichever layers are active — switching between competing versions is a first-class feature.
 
 ---
 
-## Database models
+## Database model
 
-Requires `pip install tmachine[api]` and PostgreSQL (or SQLite for dev).
+Requires `pip install tmachine[api]` and a database (PostgreSQL recommended; SQLite works for development).
 
 ```bash
 export DATABASE_URL="postgresql+psycopg2://user:pass@localhost:5432/tmachine"
@@ -551,30 +583,20 @@ Base.metadata.create_all(engine)
 "
 ```
 
-### `MemoryProposal`
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | bigint PK | — |
-| `scene` | string | Base `.ply` path (indexed) |
-| `prompt` | text | Edit instruction |
-| `preview_path` | string | Path to the 2D AI-edited PNG |
-| `status` | enum | `PENDING` / `APPROVED` / `REJECTED` |
-| `votes_yes` / `votes_no` | int | Community vote counts |
-| `cam_x` … `cam_fov_x` | float | Camera parameters |
-| `bake_job_id` | string | Celery task ID set on approval |
-
 ### `MemoryLayer`
 
 | Column | Type | Description |
 |---|---|---|
 | `id` | bigint PK | — |
-| `proposal_id` | FK → `MemoryProposal` | Source proposal |
 | `scene` | string | Base `.ply` path (indexed) |
-| `patch_path` | string | Path to the patch `.ply` |
-| `hidden_indices` | JSON `int[]` | Base-scene rows to suppress |
+| `patch_path` | string | Absolute path to the patch `.ply` |
+| `hidden_indices` | JSON `int[]` | Base-scene row indices to suppress |
 | `changed_splat_count` | int | Splats in the patch |
-| `initial_loss` / `final_loss` | float | Optimization quality metrics |
+| `initial_loss` | float | Loss before optimization |
+| `final_loss` | float | Loss after optimization |
+| `iterations_run` | int | Optimizer steps taken |
+| `external_ref` | string | Opaque caller reference (nullable, indexed) |
+| `created_at` | datetime | UTC creation timestamp |
 
 ---
 
@@ -617,11 +639,13 @@ pip install -e ".[full,dev]"
 | `TMACHINE_DEVICE` | auto | `cuda` / `mps` / `cpu` |
 | `TMACHINE_IP2P_MODEL` | `timbrooks/instruct-pix2pix` | InstructPix2Pix model ID or local path |
 | `TMACHINE_WHISPER_MODEL` | `base` | Whisper model size |
-| `OPENAI_API_KEY` | — | GPT-4o-mini prompt extraction (optional) |
+| `OPENAI_API_KEY` | — | LLM prompt extraction (optional) |
 | `REDIS_URL` | `redis://localhost:6379/0` | Celery broker + result backend |
 | `DATABASE_URL` | `postgresql+psycopg2://tmachine:tmachine@localhost:5432/tmachine` | PostgreSQL DSN |
-| `PREVIEW_DIR` | `./previews` | Directory for proposal preview PNGs |
+| `PREVIEW_DIR` | `./previews` | Directory where preview PNGs are saved |
 | `LOCK_TIMEOUT` | `300` | Seconds to wait for a `.ply` file lock |
+| `TMACHINE_SCENE_ROOT` | — | Restrict `.ply` access to a directory (recommended in production) |
+| `TMACHINE_RENDERER_CACHE_SIZE` | `8` | Max scenes held in GPU memory by the render cache |
 
 ---
 

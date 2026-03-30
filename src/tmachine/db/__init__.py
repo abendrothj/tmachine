@@ -1,8 +1,8 @@
-from .models import Base, MemoryProposal, MemoryLayer, ProposalStatus
+from .models import Base, MemoryLayer
 from .session import SessionLocal, engine, get_db
 
 __all__ = [
     "Base",
-    "MemoryProposal", "MemoryLayer", "ProposalStatus",
+    "MemoryLayer",
     "SessionLocal", "engine", "get_db",
 ]

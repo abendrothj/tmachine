@@ -26,12 +26,17 @@ LOCK_TIMEOUT           Max seconds to wait for a .ply file lock.  Default: 300
 
 API overview
 ------------
-GET  /render              → PNG image (Module 1)
-POST /mutate/image        → {job_id}  (Module 3 only — upload edited image)
-POST /mutate/prompt       → {job_id}  (full pipeline — text prompt)
-POST /voice-edit          → {job_id, transcript, edit_prompt}
-GET  /status/{job_id}     → {status, result?, error?}
-GET  /health              → {"status": "ok"}
+GET  /render                  → PNG image (Module 1)
+POST /previews/generate       → {job_id}  (Stage 1 — render + AI edit → preview PNG)
+POST /previews/voice          → {job_id, transcript, edit_prompt}
+GET  /previews/{filename}     → PNG image (serve saved preview)
+POST /layers/bake             → {job_id}  (Stage 2 — bake preview into patch .ply)
+GET  /layers                  → [{layer}]
+POST /mutate/image            → {job_id}  (Module 3 only — upload edited image)
+POST /mutate/prompt           → {job_id}  (full pipeline — text prompt)
+POST /voice-edit              → {job_id, transcript, edit_prompt}
+GET  /status/{job_id}         → {status, result?, error?}
+GET  /health                  → {"status": "ok"}
 """
 
 from __future__ import annotations
@@ -50,7 +55,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .routes.render import router as render_router
 from .routes.mutate import router as mutate_router
-from .routes.proposals import router as proposals_router
+from .routes.layers import router as layers_router
 
 # ---------------------------------------------------------------------------
 # Application
@@ -86,9 +91,9 @@ app.add_middleware(
 # Routers
 # ---------------------------------------------------------------------------
 
-app.include_router(render_router,    tags=["Rendering"])
-app.include_router(mutate_router,    tags=["Mutation"])
-app.include_router(proposals_router, tags=["Memory Layers"])
+app.include_router(render_router,  tags=["Rendering"])
+app.include_router(layers_router,  tags=["Memory Layers"])
+app.include_router(mutate_router,  tags=["Mutation"])
 
 # ---------------------------------------------------------------------------
 # Health check — used by load balancers / container orchestrators

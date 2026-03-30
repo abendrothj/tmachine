@@ -3,21 +3,21 @@ tmachine/api/worker.py — Celery application + task definitions.
 
 Architecture — Memory Layer pipeline
 ---------------------------------------
-The pipeline is now split into two explicit stages with human review between them:
+The pipeline is split into two stages.  The approval workflow between them
+is the responsibility of the calling application, not the engine.
 
-Stage 1 ── generate_memory_proposal  (fast, ~20-60 s)
+Stage 1 ── generate_preview  (fast, ~20-60 s)
     • Render current scene (Module 1)
     • Edit rendered image with InstructPix2Pix (or accept uploaded image)
     • Save the 2D preview PNG to disk
-    • Write a MemoryProposal row (status=PENDING) to the database
-    • Return immediately — no 3D modification yet
+    • Return {preview_filename, preview_path, prompt} — no DB write
 
     ══════════════════════════════
-    ←── HUMAN REVIEW / VOTING ──►
+    ←── CALLER'S APPROVAL LOGIC ──►
     ══════════════════════════════
 
-Stage 2 ── bake_approved_patch  (slow, ~2-5 min)
-    • Triggered only after a proposal is approved
+Stage 2 ── bake_patch  (slow, ~2-5 min)
+    • Triggered by the caller after they decide to commit the preview
     • Runs SplatMutator.mutate() → produces a patch .ply + hidden_indices
     • Writes a MemoryLayer row to the database
     • Never touches the base .ply file
@@ -106,21 +106,21 @@ def _pil_to_tensor(img):
     return torch.from_numpy(arr)
 
 
-def _save_preview(pil_img, proposal_id: int) -> str:
-    """Save a PIL image as the preview PNG for a proposal; return its path."""
+def _save_preview(pil_img, filename: str) -> str:
+    """Save a PIL image as a preview PNG; return its absolute path."""
     _PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    path = _PREVIEW_DIR / f"proposal_{proposal_id}.png"
+    path = _PREVIEW_DIR / filename
     pil_img.save(str(path), format="PNG")
     return str(path)
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 — generate_memory_proposal
+# Stage 1 — generate_preview
 # ---------------------------------------------------------------------------
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=10,
-                 name="generate_memory_proposal")
-def generate_memory_proposal(
+                 name="generate_preview")
+def generate_preview(
     self,
     scene: str,
     camera_dict: dict,
@@ -133,25 +133,19 @@ def generate_memory_proposal(
     """
     Stage 1 — Render the scene, apply the AI image edit, save a 2D preview.
 
-    **No 3D modification.  No patch file.  No SplatMutator.**
-
-    Creates one ``MemoryProposal`` row (status=PENDING) and returns its ID.
-    The frontend can then display the preview at ``GET /proposals/{id}/preview``
-    and collect votes before anything touches the 3D scene.
+    **No 3D modification.  No DB write.**
 
     Returns
     -------
-    dict with keys: proposal_id, preview_path, prompt
+    dict with keys: preview_filename, preview_path, prompt
     """
     from ..ai.image_editor import ImageEditor
     from ..core.renderer import ViewportRenderer
-    from ..db.models import MemoryProposal, ProposalStatus
-    from ..db.session import SessionLocal
 
     camera = _camera_from_dict(camera_dict)
 
     # ── Module 1: Render current base scene ───────────────────────────────
-    logger.info("Rendering scene for proposal: %r", prompt)
+    logger.info("Rendering scene for preview: %r", prompt)
     renderer        = ViewportRenderer(scene)
     original_tensor = renderer.render(camera, sh_degree=sh_degree)
     original_pil    = _tensor_to_pil(original_tensor)
@@ -168,66 +162,57 @@ def generate_memory_proposal(
     )
     editor.unload()
 
-    # ── Persist proposal to DB (get ID first) ─────────────────────────────
-    with SessionLocal() as db:
-        proposal = MemoryProposal(
-            scene=scene,
-            prompt=prompt,
-            preview_path="",           # filled in after we know the ID
-            status=ProposalStatus.PENDING,
-            cam_x=camera_dict["x"],
-            cam_y=camera_dict["y"],
-            cam_z=camera_dict["z"],
-            cam_pitch=camera_dict["pitch"],
-            cam_yaw=camera_dict["yaw"],
-            cam_roll=camera_dict["roll"],
-            cam_fov_x=camera_dict["fov_x"],
-            cam_width=camera_dict["width"],
-            cam_height=camera_dict["height"],
-        )
-        db.add(proposal)
-        db.commit()
-        db.refresh(proposal)
-        proposal_id = proposal.id
+    # ── Save preview PNG ──────────────────────────────────────────────────
+    preview_filename = f"preview_{uuid.uuid4().hex}.png"
+    preview_path     = _save_preview(edited_pil, preview_filename)
 
-        # Save preview PNG using the DB-assigned ID
-        preview_path = _save_preview(edited_pil, proposal_id)
-        proposal.preview_path = preview_path
-        db.commit()
-
-    logger.info("Proposal %d created: %s", proposal_id, preview_path)
-    return {"proposal_id": proposal_id, "preview_path": preview_path, "prompt": prompt}
+    logger.info("Preview saved: %s", preview_path)
+    return {
+        "preview_filename": preview_filename,
+        "preview_path":     preview_path,
+        "prompt":           prompt,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 — bake_approved_patch
+# Stage 2 — bake_patch
 # ---------------------------------------------------------------------------
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=10,
-                 name="bake_approved_patch")
-def bake_approved_patch(
+                 name="bake_patch")
+def bake_patch(
     self,
-    proposal_id: int,
+    scene: str,
+    edited_image_b64: str,
+    camera_dict: dict,
     patch_dir: Optional[str] = None,
     n_iters: int = 300,
     sh_degree: int = 3,
+    external_ref: Optional[str] = None,
 ) -> dict[str, Any]:
     """
-    Stage 2 — Run the SplatMutator for an approved proposal and save the patch.
+    Stage 2 — Run the SplatMutator from a pre-edited image and save the patch.
 
-    Reads all required data (scene, camera, preview image) from the DB row.
+    Does not load from DB — all required data is passed directly.
     Produces a patch .ply + hidden_indices, writes a ``MemoryLayer`` row.
     Never modifies the base .ply.
 
     Parameters
     ----------
-    proposal_id :
-        Primary key of the approved ``MemoryProposal``.
+    scene :
+        Absolute path to the base .ply file.
+    edited_image_b64 :
+        Base64-encoded PNG/JPEG of the AI-edited image.
+    camera_dict :
+        Camera parameters dict (same shape as CameraParams).
     patch_dir :
         Directory for patch .ply files.  Default: same directory as the
         source .ply.
     n_iters, sh_degree :
         Forwarded to :meth:`SplatMutator.mutate`.
+    external_ref :
+        Opaque reference from the caller (e.g. their proposal ID).
+        Stored on the MemoryLayer row; not interpreted by the engine.
 
     Returns
     -------
@@ -242,50 +227,27 @@ def bake_approved_patch(
     from PIL import Image as PILImage
 
     from ..core.splat_mutator import SplatMutator
-    from ..db.models import MemoryLayer, MemoryProposal, ProposalStatus
+    from ..db.models import MemoryLayer
     from ..db.session import SessionLocal
 
-    # ── Load proposal from DB ─────────────────────────────────────────────
-    with SessionLocal() as db:
-        proposal = db.get(MemoryProposal, proposal_id)
-        if proposal is None:
-            raise ValueError(f"MemoryProposal {proposal_id} not found")
-        if proposal.status != ProposalStatus.APPROVED:
-            raise ValueError(
-                f"Proposal {proposal_id} is not APPROVED (status={proposal.status})"
-            )
-        # Capture all values while session is open
-        scene        = proposal.scene
-        preview_path = proposal.preview_path
-        cam_dict     = {
-            "x":      proposal.cam_x,
-            "y":      proposal.cam_y,
-            "z":      proposal.cam_z,
-            "pitch":  proposal.cam_pitch,
-            "yaw":    proposal.cam_yaw,
-            "roll":   proposal.cam_roll,
-            "fov_x":  proposal.cam_fov_x,
-            "width":  proposal.cam_width,
-            "height": proposal.cam_height,
-            "near":   0.01,
-            "far":    1000.0,
-        }
+    camera = _camera_from_dict(camera_dict)
 
-    camera       = _camera_from_dict(cam_dict)
-    edited_pil   = PILImage.open(preview_path).convert("RGB")
+    # ── Decode edited image ───────────────────────────────────────────────
+    image_bytes   = base64.b64decode(edited_image_b64)
+    edited_pil    = PILImage.open(io.BytesIO(image_bytes)).convert("RGB")
     edited_tensor = _pil_to_tensor(
-        edited_pil.resize((cam_dict["width"], cam_dict["height"]))
+        edited_pil.resize((camera_dict["width"], camera_dict["height"]))
     )
 
     # ── Determine patch output path ───────────────────────────────────────
     base_dir  = Path(patch_dir) if patch_dir else Path(scene).parent
-    patch_out = str(base_dir / f"patch_{proposal_id}_{uuid.uuid4().hex[:8]}.ply")
+    patch_out = str(base_dir / f"patch_{uuid.uuid4().hex[:8]}.ply")
     lock_path = patch_out + ".lock"
 
     # ── Run SplatMutator ──────────────────────────────────────────────────
     try:
         with FileLock(lock_path, timeout=_LOCK_TIMEOUT):
-            logger.info("Baking patch for proposal %d → %s", proposal_id, patch_out)
+            logger.info("Baking patch → %s", patch_out)
             mutator = SplatMutator(scene)
             result  = mutator.mutate(
                 camera=camera,
@@ -296,13 +258,12 @@ def bake_approved_patch(
             )
             logger.info("Bake complete: %s", result)
     except Timeout as exc:
-        logger.warning("Lock timeout for proposal %d — retrying", proposal_id)
+        logger.warning("Lock timeout — retrying")
         raise self.retry(exc=exc)
 
     # ── Write MemoryLayer to DB ────────────────────────────────────────────
     with SessionLocal() as db:
         layer = MemoryLayer(
-            proposal_id=proposal_id,
             scene=scene,
             patch_path=result.patch_path,
             hidden_indices=result.hidden_indices,
@@ -310,13 +271,14 @@ def bake_approved_patch(
             initial_loss=result.initial_loss,
             final_loss=result.final_loss,
             iterations_run=result.iterations_run,
+            external_ref=external_ref,
         )
         db.add(layer)
         db.commit()
         db.refresh(layer)
         layer_id = layer.id
 
-    logger.info("MemoryLayer %d created for proposal %d", layer_id, proposal_id)
+    logger.info("MemoryLayer %d created", layer_id)
     return {
         "layer_id":            layer_id,
         "patch_path":          result.patch_path,
@@ -329,7 +291,7 @@ def bake_approved_patch(
 
 
 # ---------------------------------------------------------------------------
-# Legacy tasks — direct mutation without the DB / proposal workflow
+# Legacy tasks — direct mutation without the DB / layer workflow
 # ---------------------------------------------------------------------------
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=10,
@@ -350,7 +312,7 @@ def mutate_from_prompt(
     Legacy direct task — render → AI edit → SplatMutator → patch file.
 
     Does **not** write to the database.  For the full Memory Layers workflow
-    use ``generate_memory_proposal`` + ``bake_approved_patch``.
+    use ``generate_preview`` + ``bake_patch``.
     """
     try:
         from filelock import FileLock, Timeout
@@ -420,7 +382,7 @@ def mutate_from_image(
     Run Module 3 directly from a base64-encoded edited image.
 
     This task does **not** write to the database.  It is kept for direct
-    API calls where the caller manages proposal tracking externally.
+    API calls where the caller manages layer tracking externally.
     Returns patch_path + hidden_indices for the caller to store.
     """
     try:
